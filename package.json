@@ -1,9 +1,8 @@
-n{
+{
   "name": "management-panel-api",
   "version": "1.0.0",
   "description": "Management Panel API for MaxHealth Dashboard",
   "main": "src/server.js",
-  "type": "module",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js"
