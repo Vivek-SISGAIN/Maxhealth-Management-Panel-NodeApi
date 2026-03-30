@@ -1,0 +1,123 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// 1. Management KPI Table
+model ManagementKPI {
+  Id          String   @id @default(uuid()) @db.Uuid
+  Name        String
+  Value       String
+  Change      String?
+  Trend       String?
+  Period      String?
+  Category    String?
+  Department  String?
+  RecordedAt  DateTime @default(now()) @db.Timestamptz
+  CreatedAt   DateTime @default(now()) @db.Timestamptz
+  UpdatedAt   DateTime @default(now()) @db.Timestamptz
+
+  @@index([Name])
+  @@index([Department])
+  @@index([RecordedAt])
+}
+
+// 2. Management Department Metrics Table
+model ManagementDepartmentMetric {
+  Id            String   @id @default(uuid()) @db.Uuid
+  DepartmentName String
+  MetricKey     String
+  MetricValue   String
+  RecordedAt    DateTime @default(now()) @db.Timestamptz
+  CreatedAt     DateTime @default(now()) @db.Timestamptz
+  UpdatedAt     DateTime @default(now()) @db.Timestamptz
+
+  @@index([DepartmentName])
+  @@index([RecordedAt])
+}
+
+// 3. Management Analytics Snapshot Table
+model ManagementAnalyticsSnapshot {
+  Id          String   @id @default(uuid()) @db.Uuid
+  Period      String
+  Type        String
+  Data        Json
+  RecordedAt  DateTime @default(now()) @db.Timestamptz
+  CreatedAt   DateTime @default(now()) @db.Timestamptz
+  UpdatedAt   DateTime @default(now()) @db.Timestamptz
+
+  @@index([Period])
+  @@index([Type])
+  @@index([RecordedAt])
+}
+
+// 4. Management Alert Table
+model ManagementAlert {
+  Id              String    @id @default(uuid()) @db.Uuid
+  Type            String
+  Title           String
+  Message         String
+  Department      String?
+  Severity        String    @default("medium")
+  Status          String    @default("active")
+  ActionRequired  Boolean   @default(false)
+  Source          String?
+  Metadata        Json?
+  ExpiresAt       DateTime? @db.Timestamptz
+  AcknowledgedBy  String?
+  AcknowledgedAt  DateTime? @db.Timestamptz
+  ResolvedBy      String?
+  ResolvedAt      DateTime? @db.Timestamptz
+  CreatedAt       DateTime  @default(now()) @db.Timestamptz
+  UpdatedAt       DateTime  @default(now()) @db.Timestamptz
+
+  @@index([Status])
+  @@index([Severity])
+  @@index([Department])
+  @@index([CreatedAt])
+}
+
+// 5. Management Approval Table
+model ManagementApproval {
+  Id              String    @id @default(uuid()) @db.Uuid
+  ApprovalCode    String    @unique
+  Type            String
+  Department      String
+  Requestor       String
+  RequestorId     String?
+  Description     String
+  Details         String?
+  Amount          String?
+  Priority        String    @default("medium")
+  Status          String    @default("pending")
+  DueDate         DateTime? @db.Timestamptz
+  DecidedBy       String?
+  DecidedAt       DateTime? @db.Timestamptz
+  RejectionNotes  String?
+  Metadata        Json?
+  SubmittedDate   DateTime  @default(now()) @db.Timestamptz
+  CreatedAt       DateTime  @default(now()) @db.Timestamptz
+  UpdatedAt       DateTime  @default(now()) @db.Timestamptz
+
+  @@index([Status])
+  @@index([Priority])
+  @@index([Department])
+  @@index([SubmittedDate])
+}
+
+// 6. Management Chat Message Table
+model ManagementChatMessage {
+  Id        String   @id @default(uuid()) @db.Uuid
+  SessionId String
+  UserId    String?
+  Role      String
+  Content   String
+  CreatedAt DateTime @default(now()) @db.Timestamptz
+
+  @@index([SessionId])
+  @@index([CreatedAt])
+}
