@@ -7,6 +7,42 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum TaskType {
+  PREAUTH
+  UNDERWRITING
+  RENEWAL
+  LOADING
+  LATE_ADDITION
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum TaskStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  SLA_BREACH
+}
+
+enum UnderwritingStatus {
+  NEW
+  IN_REVIEW
+  COMPLETED
+  ON_HOLD
+}
+
+enum UnderwritingResult {
+  APPROVED
+  CONDITIONAL
+  REJECTED
+}
+
 // 1. Management KPI Table
 model ManagementKPI {
   Id          String   @id @default(uuid()) @db.Uuid
@@ -120,4 +156,59 @@ model ManagementChatMessage {
 
   @@index([SessionId])
   @@index([CreatedAt])
+}
+
+// 7. Shared Medical Workbench Tables (read/write for approvals flow)
+model MedicalTask {
+  Id          String    @id
+  TaskType    TaskType
+  CaseId      String?
+  PolicyId    String?
+  AssignedTo  String?
+  Priority    Priority
+  Status      TaskStatus
+  SlaDeadline DateTime
+  SlaBreach   Boolean
+  Metadata    Json?
+  CreatedAt   DateTime
+  UpdatedAt   DateTime
+  CompletedAt DateTime?
+
+  @@index([TaskType])
+  @@index([Status])
+  @@index([CaseId])
+  @@map("MedicalTask")
+}
+
+model UnderwritingCase {
+  Id             String    @id
+  CaseId         String
+  Client         String
+  Broker         String?
+  PolicyType     String
+  MemberCount    Int
+  RiskScore      Float?
+  Status         UnderwritingStatus
+  Result         UnderwritingResult?
+  AssignedDoctor String?
+  Notes          String?
+  CompletedAt    DateTime?
+  CreatedAt      DateTime
+  UpdatedAt      DateTime
+
+  @@index([CaseId])
+  @@map("UnderwritingCase")
+}
+
+model UnderwritingMember {
+  Id           String @id
+  CaseId       String
+  MemberId     String
+  Name         String
+  Age          Int
+  Gender       String
+  PlanCategory String?
+
+  @@index([CaseId])
+  @@map("UnderwritingMember")
 }
