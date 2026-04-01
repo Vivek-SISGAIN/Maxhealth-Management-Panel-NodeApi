@@ -23,7 +23,7 @@ npm-debug.log*
 .idea/
 *.swp
 *.swo
-
+deploy.sh
 # OS
 .DS_Store
 Thumbs.db
