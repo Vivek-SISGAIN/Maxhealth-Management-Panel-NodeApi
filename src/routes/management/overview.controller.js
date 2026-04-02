@@ -79,7 +79,8 @@ router.get("/overview", async (req, res) => {
         departmentStatus,
         stats: {
           approvals: { total: await prisma.managementApproval.count(), pending: pendingApprovals.length, approved: await prisma.managementApproval.count({ where: { Status: 'approved' } }), rejected: await prisma.managementApproval.count({ where: { Status: 'rejected' } }) },
-          alerts: { total: await prisma.managementAlert.count(), active: activeAlerts.length, acknowledged: await prisma.managementAlert.count({ where: { Status: 'acknowledged' } }), resolved: await prisma.managementAlert.count({ where: { Status: 'resolved' } }) }
+          alerts: { total: await prisma.managementAlert.count(), active: activeAlerts.length, acknowledged: await prisma.managementAlert.count({ where: { Status: 'acknowledged' } }), resolved: await prisma.managementAlert.count({ where: { Status: 'resolved' } }) },
+          medicalCases: { total: await prisma.underwritingCase.count(), new: await prisma.underwritingCase.count({ where: { Status: 'NEW' } }), inReview: await prisma.underwritingCase.count({ where: { Status: 'IN_REVIEW' } }), completed: await prisma.underwritingCase.count({ where: { Status: 'COMPLETED' } }), slaBreached: await prisma.medicalTask.count({ where: { SlaBreach: true } }) }
         }
       }
     });
