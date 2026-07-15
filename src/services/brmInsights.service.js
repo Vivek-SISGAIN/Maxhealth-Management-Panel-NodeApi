@@ -9,6 +9,28 @@ const prisma = new PrismaClient();
 /** Match BRM Assign form intent + include Admin as management asked */
 const BRM_ROLE_NAMES = ["BRM", "Admin"];
 
+/** Latest member row per Name+DOB (handles duplicated census on a case version). */
+const quotationMemberGpSql = (caseIdExpr) => `
+  (
+    SELECT COALESCE(SUM(deduped."TotalAmount"), 0)
+    FROM (
+      SELECT DISTINCT ON (
+        TRIM(COALESCE(qm."Name", '')),
+        qm."DateofBirth"
+      )
+        qm."TotalAmount"
+      FROM public."HealthInsuranceQuotationMember" qm
+      WHERE qm."HealthInsuranceQuotationCaseID" = ${caseIdExpr}
+        AND COALESCE(qm."IsDeleted", false) = false
+        AND COALESCE(qm."IsArchived", false) = false
+      ORDER BY
+        TRIM(COALESCE(qm."Name", '')),
+        qm."DateofBirth",
+        qm."ID" DESC
+    ) deduped
+  )
+`;
+
 const toNumber = (v) => {
   if (v == null) return 0;
   if (typeof v === "bigint") return Number(v);
@@ -544,21 +566,13 @@ async function getCases({
           brm."Potential" AS "brm_potential",
           brm."ConfirmStatus" AS "brm_confirm_status",
           COALESCE(
-            (
-              SELECT SUM(qm."TotalAmount")
-              FROM public."HealthInsuranceQuotationMember" qm
-              WHERE qm."HealthInsuranceQuotationCaseID" = l."ID"
-            ),
+            NULLIF(${quotationMemberGpSql('l."ID"')}, 0),
             l."TargetPremium",
             0
           )::float AS "gross_premium",
           (
             COALESCE(
-              (
-                SELECT SUM(qm."TotalAmount")
-                FROM public."HealthInsuranceQuotationMember" qm
-                WHERE qm."HealthInsuranceQuotationCaseID" = l."ID"
-              ),
+              NULLIF(${quotationMemberGpSql('l."ID"')}, 0),
               l."TargetPremium",
               0
             ) - COALESCE(l."TargetPremium", 0)
@@ -672,12 +686,12 @@ async function getCases({
          brm."Potential" AS "brm_potential",
          brm."ConfirmStatus" AS "brm_confirm_status",
          COALESCE(
-           (SELECT SUM(qm."TotalAmount") FROM public."HealthInsuranceQuotationMember" qm WHERE qm."HealthInsuranceQuotationCaseID" = qc."ID"),
+           NULLIF(${quotationMemberGpSql('qc."ID"')}, 0),
            qc."TargetPremium", 0
          )::float AS "gross_premium",
          (
            COALESCE(
-             (SELECT SUM(qm."TotalAmount") FROM public."HealthInsuranceQuotationMember" qm WHERE qm."HealthInsuranceQuotationCaseID" = qc."ID"),
+             NULLIF(${quotationMemberGpSql('qc."ID"')}, 0),
              qc."TargetPremium", 0
            ) - COALESCE(qc."TargetPremium", 0)
          )::float AS "difference"
