@@ -52,9 +52,25 @@ const transformApproval = (approval) => ({
 
 const transformMedicalApproval = (item) => {
   const summary = item.workbench.summary || {};
+  const snap = item.workbench.formSnapshot || {};
   const adjustedPremium = Number(summary.adjustedPremium || 0);
-  const clinicalNotes = item.workbench.underwritingRemarks || item.workbench.clinicalRemarks || "";
-  const urgency = adjustedPremium > 200000 ? "urgent" : adjustedPremium > 100000 ? "high" : "medium";
+  const uwNotes = item.workbench.underwritingRemarks || snap.underwritingRemarks || "";
+  const clinicalNotes = item.workbench.clinicalRemarks || snap.clinicalRemarks || "";
+  const specialNotes = item.workbench.specialRemarks || snap.specialRemarks || "";
+  const detailsParts = [uwNotes, clinicalNotes, specialNotes].map((s) => String(s || "").trim()).filter(Boolean);
+  const urgency =
+    String(item.workbench.riskLevel || "").toUpperCase() === "HIGH" || adjustedPremium > 200000
+      ? "urgent"
+      : adjustedPremium > 100000 || String(item.workbench.riskLevel || "").toUpperCase() === "MEDIUM"
+        ? "high"
+        : "medium";
+
+  const submitter =
+    [...(item.workbench.stageHistory || [])]
+      .reverse()
+      .find((h) => h.stage === "SENT_FOR_MANAGEMENT_APPROVAL" || h.stage === "RESUBMITTED")?.by ||
+    item.workbench.stageHistory?.[item.workbench.stageHistory.length - 1]?.by ||
+    "medical";
 
   return {
     id: buildApprovalId(item.task.Id, item.memberId),
@@ -62,25 +78,35 @@ const transformMedicalApproval = (item) => {
     referenceId: item.underwritingCase?.Id || item.task.CaseId,
     type: "Medical Underwriting Approval",
     department: "Medical Underwriting",
-    requestor: item.workbench.stageHistory?.[0]?.by || "medical",
-    requestorId: item.workbench.stageHistory?.[0]?.by || null,
-    description: `Underwriting decision required for ${item.memberName || "member"}`,
-    details: clinicalNotes || "Medical underwriting case submitted to management for decision.",
-    amount: adjustedPremium ? `AED ${adjustedPremium.toLocaleString("en-AE", { maximumFractionDigits: 0 })}` : null,
+    requestor: submitter,
+    requestorId: submitter,
+    description: `Underwriting decision required for ${item.memberName || item.underwritingMember?.Name || "member"}`,
+    details: detailsParts.length ? detailsParts.join("\n\n") : null,
+    amount: adjustedPremium
+      ? `AED ${adjustedPremium.toLocaleString("en-AE", { maximumFractionDigits: 0 })}`
+      : null,
     priority: urgency,
     status: stageToStatus(item.workbench.stage),
     dueDate: item.task.SlaDeadline ? new Date(item.task.SlaDeadline).toLocaleDateString() : "N/A",
     submittedDate: item.workbench.stageUpdatedAt || item.task.UpdatedAt,
     decidedBy: item.workbench?.managementDecision?.by || null,
     decidedAt: item.workbench?.managementDecision?.at || null,
-    rejectionNotes: item.workbench?.managementDecision?.decision === "REJECTED" ? (item.workbench?.managementDecision?.notes || null) : null,
+    rejectionNotes:
+      item.workbench?.managementDecision?.decision === "REJECTED"
+        ? item.workbench?.managementDecision?.notes || null
+        : null,
     icon: "Shield",
     source: "medical_workbench",
     taskId: item.task.Id,
-    caseId: item.task.CaseId,
-    memberId: item.memberId,
+    caseId: item.underwritingCase?.CaseId || item.task.CaseId,
+    memberId: item.underwritingMember?.MemberId || item.memberId,
     memberName: item.memberName || item.underwritingMember?.Name || "Unknown",
+    memberAge: snap.age ?? item.underwritingMember?.Age ?? null,
+    memberGender: item.underwritingMember?.Gender || null,
+    riskLevel: item.workbench.riskLevel || snap.riskLevel || null,
     workbenchStage: item.workbench.stage,
+    documentCount: Array.isArray(item.workbench.documents) ? item.workbench.documents.length : 0,
+    messageCount: Array.isArray(item.workbench.messages) ? item.workbench.messages.length : 0,
     summary: {
       annualPremium: Number(summary.annualPremium || 0),
       medicalServicesCharges: Number(summary.medicalServicesCharges || 0),
@@ -91,6 +117,52 @@ const transformMedicalApproval = (item) => {
     },
   };
 };
+
+/** Full workbench payload for Management review UI */
+const buildWorkbenchPayload = (workbench = {}) => ({
+  stage: workbench.stage,
+  stageUpdatedAt: workbench.stageUpdatedAt,
+  stageHistory: workbench.stageHistory || [],
+  messages: workbench.messages || [],
+  riskLevel: workbench.riskLevel || workbench.formSnapshot?.riskLevel || null,
+  clinicalRemarks: workbench.clinicalRemarks || workbench.formSnapshot?.clinicalRemarks || null,
+  underwritingRemarks: workbench.underwritingRemarks || workbench.formSnapshot?.underwritingRemarks || null,
+  specialRemarks: workbench.specialRemarks || workbench.formSnapshot?.specialRemarks || null,
+  complicationPercent: workbench.complicationPercent ?? workbench.summary?.complicationPercent ?? null,
+  summary: workbench.summary || null,
+  chargesBreakdown: workbench.chargesBreakdown || null,
+  documents: workbench.documents || [],
+  formSnapshot: workbench.formSnapshot || null,
+  managementDecision: workbench.managementDecision || null,
+  lastInfoRequest: workbench.lastInfoRequest || null,
+  lastBrmResponse: workbench.lastBrmResponse || null,
+  brmDocuments: workbench.brmDocuments || [],
+});
+
+async function syncMemberDecision(memberId, decision, decidedBy, notes) {
+  try {
+    await prisma.$executeRaw`
+      UPDATE "UnderwritingMember"
+      SET "MedicalCheckStatus" = ${decision}::"MedicalCheckStatus",
+          "DecisionNotes" = ${notes || null},
+          "DecidedBy" = ${decidedBy || "management"}
+      WHERE "Id" = ${memberId}
+    `;
+  } catch (err) {
+    try {
+      // Fallback if enum cast fails — store as text via unconstrained update
+      await prisma.$executeRawUnsafe(
+        `UPDATE "UnderwritingMember" SET "MedicalCheckStatus" = $1, "DecisionNotes" = $2, "DecidedBy" = $3 WHERE "Id" = $4`,
+        decision,
+        notes || null,
+        decidedBy || "management",
+        memberId,
+      );
+    } catch (err2) {
+      console.warn("[approvals] UnderwritingMember status sync skipped:", err2?.message || err?.message);
+    }
+  }
+}
 
 async function fetchMedicalApprovals(options = {}) {
   const { status } = options;
@@ -116,10 +188,16 @@ async function fetchMedicalApprovals(options = {}) {
 
   const caseIds = [...new Set(tasks.map((t) => t.CaseId).filter(Boolean))];
   const underwritingCases = caseIds.length
-    ? await prisma.underwritingCase.findMany({ where: { Id: { in: caseIds } } })
+    ? await prisma.underwritingCase.findMany({
+        where: { OR: [{ Id: { in: caseIds } }, { CaseId: { in: caseIds } }] },
+      })
     : [];
 
-  const underwritingMap = new Map(underwritingCases.map((c) => [c.Id, c]));
+  const underwritingMap = new Map();
+  for (const c of underwritingCases) {
+    underwritingMap.set(c.Id, c);
+    underwritingMap.set(c.CaseId, c);
+  }
 
   const memberIdsSet = new Set();
   const items = [];
@@ -271,8 +349,14 @@ router.get("/approvals/:id", async (req, res) => {
     }
 
     const [underwritingCase, underwritingMember] = await Promise.all([
-      task.CaseId ? prisma.underwritingCase.findUnique({ where: { Id: task.CaseId } }) : Promise.resolve(null),
-      prisma.underwritingMember.findUnique({ where: { Id: memberId } }),
+      task.CaseId
+        ? prisma.underwritingCase.findFirst({
+            where: { OR: [{ Id: task.CaseId }, { CaseId: task.CaseId }] },
+          })
+        : Promise.resolve(null),
+      prisma.underwritingMember.findFirst({
+        where: { OR: [{ Id: memberId }, { MemberId: memberId }] },
+      }),
     ]);
 
     res.json({
@@ -283,23 +367,12 @@ router.get("/approvals/:id", async (req, res) => {
           memberId,
           underwritingCase,
           underwritingMember,
-          memberName: underwritingMember?.Name || null,
+          memberName: workbench.formSnapshot?.memberName || underwritingMember?.Name || null,
           workbench,
         }),
-        workbench: {
-          stage: workbench.stage,
-          stageUpdatedAt: workbench.stageUpdatedAt,
-          stageHistory: workbench.stageHistory || [],
-          messages: workbench.messages || [],
-          riskLevel: workbench.riskLevel,
-          clinicalRemarks: workbench.clinicalRemarks || null,
-          underwritingRemarks: workbench.underwritingRemarks || null,
-          summary: workbench.summary || null,
-          chargesBreakdown: workbench.chargesBreakdown || null,
-          documents: workbench.documents || [],
-          formSnapshot: workbench.formSnapshot || null,
-          managementDecision: workbench.managementDecision || null,
-        },
+        workbench: buildWorkbenchPayload(workbench),
+        client: underwritingCase?.Client || null,
+        broker: underwritingCase?.Broker || null,
       },
     });
   } catch (err) {
@@ -369,7 +442,31 @@ router.patch("/approvals/:id/approve", async (req, res) => {
       },
     });
 
-    res.json({ success: true, data: transformMedicalApproval({ task: updated, memberId, memberName: member.formSnapshot?.memberName, workbench: nextMember }) });
+    await syncMemberDecision(memberId, "APPROVED", decidedBy, req.body.notes || null);
+
+    const uwCase = task.CaseId
+      ? await prisma.underwritingCase.findFirst({
+          where: { OR: [{ Id: task.CaseId }, { CaseId: task.CaseId }] },
+        })
+      : null;
+    const uwMember = await prisma.underwritingMember.findFirst({
+      where: { OR: [{ Id: memberId }, { MemberId: memberId }] },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        ...transformMedicalApproval({
+          task: updated,
+          memberId,
+          underwritingCase: uwCase,
+          underwritingMember: uwMember,
+          memberName: member.formSnapshot?.memberName || uwMember?.Name,
+          workbench: nextMember,
+        }),
+        workbench: buildWorkbenchPayload(nextMember),
+      },
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: "Failed to approve" });
@@ -422,7 +519,31 @@ router.patch("/approvals/:id/reject", async (req, res) => {
       },
     });
 
-    res.json({ success: true, data: transformMedicalApproval({ task: updated, memberId, memberName: member.formSnapshot?.memberName, workbench: nextMember }) });
+    await syncMemberDecision(memberId, "REJECTED", decidedBy, req.body.notes || null);
+
+    const uwCase = task.CaseId
+      ? await prisma.underwritingCase.findFirst({
+          where: { OR: [{ Id: task.CaseId }, { CaseId: task.CaseId }] },
+        })
+      : null;
+    const uwMember = await prisma.underwritingMember.findFirst({
+      where: { OR: [{ Id: memberId }, { MemberId: memberId }] },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        ...transformMedicalApproval({
+          task: updated,
+          memberId,
+          underwritingCase: uwCase,
+          underwritingMember: uwMember,
+          memberName: member.formSnapshot?.memberName || uwMember?.Name,
+          workbench: nextMember,
+        }),
+        workbench: buildWorkbenchPayload(nextMember),
+      },
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: "Failed to reject" });

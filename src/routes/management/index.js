@@ -7,6 +7,9 @@ const approvalsRouter = require("./approvals.controller");
 const alertsRouter = require("./alerts.controller");
 const chatRouter = require("./chat.controller");
 const casesRouter = require("./cases.controller");
+const brmRouter = require("./brm.controller");
+const medicalRouter = require("./medical.controller");
+const notificationsRouter = require("./notifications.controller");
 
 const router = Router();
 
@@ -18,5 +21,8 @@ router.use(approvalsRouter);
 router.use(alertsRouter);
 router.use(chatRouter);
 router.use(casesRouter); // Medical cases, tasks, members
+router.use(brmRouter); // BRM executive insights (shared DB)
+router.use(medicalRouter); // Medical Insights overview / doctor load
+router.use(notificationsRouter); // Management inbox (sound / browser notify)
 
 module.exports = router;
