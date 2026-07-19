@@ -1,24 +1,73 @@
-/**
- * Management BRM Insights — executive read aggregations against shared Postgres.
- * BRM list: AspNetRoles.Name IN ('BRM','Admin') — not hardcoded RoleId (BRM backend GUID is stale).
+﻿/**
+ * Management BRM Insights â€” executive read aggregations against shared Postgres.
+ * BRM list: AspNetRoles.Name IN ('BRM','Admin') â€” not hardcoded RoleId (BRM backend GUID is stale).
  */
 const { PrismaClient } = require("@prisma/client");
 
 const prisma = new PrismaClient();
+const Redis = require("ioredis");
+
+const redis = process.env.REDIS_URL
+  ? new Redis(process.env.REDIS_URL)
+  : null;
+
+const SUMMARY_CARDS_CACHE_TTL_SEC = parseInt(
+  process.env.REDIS_TTL_SUMMARY_CARDS || "120",
+  10,
+);
 
 /** Match BRM Assign form intent + include Admin as management asked */
 const BRM_ROLE_NAMES = ["BRM", "Admin"];
 
-/** Latest member row per Name+DOB (handles duplicated census on a case version). */
+/** Latest member row per Name+DOB (handles duplicated census on a case version).
+ * Gross = BaseAmount (formula-adjusted); falls back to PlanAmount / TotalAmount.
+ * Matches CRM HealthInsuranceQuotationCaseRepository plan-assign / Update Loading.
+ */
+const memberPremiumAmountSql = `COALESCE(qm."BaseAmount", qm."PlanAmount", qm."TotalAmount", 0)`;
+
 const quotationMemberGpSql = (caseIdExpr) => `
   (
-    SELECT COALESCE(SUM(deduped."TotalAmount"), 0)
+    SELECT COALESCE(SUM(deduped.gross_amt), 0)
     FROM (
       SELECT DISTINCT ON (
         TRIM(COALESCE(qm."Name", '')),
         qm."DateofBirth"
       )
-        qm."TotalAmount"
+        ${memberPremiumAmountSql} AS gross_amt
+      FROM public."HealthInsuranceQuotationMember" qm
+      WHERE qm."HealthInsuranceQuotationCaseID" = ${caseIdExpr}
+        AND COALESCE(qm."IsDeleted", false) = false
+        AND COALESCE(qm."IsArchived", false) = false
+      ORDER BY
+        TRIM(COALESCE(qm."Name", '')),
+        qm."DateofBirth",
+        qm."ID" DESC
+    ) deduped
+  )
+`;
+
+const planAllocatedFeePctSql = `(
+  SELECT COALESCE(SUM(fd."Percentage"), 0)
+  FROM public."HealthInsurancePlan" hp
+  INNER JOIN public."HealthInsuranceFormulaDetail" fd
+    ON fd."HealthInsuranceFormulaID" = hp."HealthInsuranceFormulaID"
+  WHERE hp."ID" = qm."HealthInsurancePlanID"
+)`;
+
+/** Net = PlanAmount Ã— (1 âˆ’ plan fees) when case formula set; else same as gross. */
+const quotationMemberNetSql = (caseIdExpr, caseFormulaIdExpr) => `
+  (
+    SELECT COALESCE(SUM(deduped.net_amt), 0)
+    FROM (
+      SELECT DISTINCT ON (
+        TRIM(COALESCE(qm."Name", '')),
+        qm."DateofBirth"
+      )
+        CASE
+          WHEN COALESCE(${caseFormulaIdExpr}, 0) > 0
+          THEN COALESCE(qm."PlanAmount", 0) * (1.0 - COALESCE(${planAllocatedFeePctSql}, 0))
+          ELSE ${memberPremiumAmountSql}
+        END AS net_amt
       FROM public."HealthInsuranceQuotationMember" qm
       WHERE qm."HealthInsuranceQuotationCaseID" = ${caseIdExpr}
         AND COALESCE(qm."IsDeleted", false) = false
@@ -35,7 +84,7 @@ const toNumber = (v) => {
   if (v == null) return 0;
   if (typeof v === "bigint") return Number(v);
   if (typeof v === "object" && v !== null) {
-    // Prisma Decimal / decimal.js → { s, e, d }
+    // Prisma Decimal / decimal.js â†’ { s, e, d }
     if (typeof v.toNumber === "function") return v.toNumber();
     if (typeof v.toString === "function" && "s" in v && "e" in v && "d" in v) {
       const n = Number(v.toString());
@@ -88,7 +137,7 @@ const withDefaultDates = ({ dateFrom, dateTo } = {}) => {
   return { dateFrom: from, dateTo: to };
 };
 
-/** Optional dates — empty means no date filter (BRM master_data parity) */
+/** Optional dates â€” empty means no date filter (BRM master_data parity) */
 const optionalDates = ({ dateFrom, dateTo } = {}) => ({
   dateFrom: dateFrom && String(dateFrom).trim() ? String(dateFrom).trim() : null,
   dateTo: dateTo && String(dateTo).trim() ? String(dateTo).trim() : null,
@@ -96,7 +145,7 @@ const optionalDates = ({ dateFrom, dateTo } = {}) => ({
 
 /**
  * Same broker user set as BRM caseDetailsList:
- * UserBrokerMapping.UserId = AspNet BRM id → CompanyId → User.ID at those companies.
+ * UserBrokerMapping.UserId = AspNet BRM id â†’ CompanyId â†’ User.ID at those companies.
  */
 const brokerUsersCteSql = (userIdParam) => `
   broker_users AS (
@@ -110,13 +159,36 @@ const brokerUsersCteSql = (userIdParam) => `
   )
 `;
 
-/** Core open NB filters matching BRM master_data */
+/**
+ * Same ownership as BRM caseDetailsList (scope=own):
+ * broker-mapped creators OR AssignedBrmExecutive OR BRM self-created.
+ * $1 must be the AspNet BRM user id.
+ */
 const MASTER_DATA_CASE_FILTER = `
-  qc."CreatedByUserID" = ANY(SELECT "ID" FROM broker_users)
-  AND qc."DisplayID" ~ '-B[0-9]+'
+  (
+    qc."CreatedByUserID" = ANY(SELECT "ID" FROM broker_users)
+    OR qc."AssignedBrmExecutive"::text = $1::text
+    OR EXISTS (
+      SELECT 1
+      FROM public."User" creator
+      WHERE creator."ID" = qc."CreatedByUserID"
+        AND creator."AspNetUserID"::text = $1::text
+    )
+  )
+  AND qc."DisplayID" ~ '-[BD][0-9]+'
   AND qc."BookingStatus" IS false
 `;
 
+/** Cheap member GP for KPI totals (no Name+DOB dedupe). */
+const memberGpSumSql = (caseIdExpr) => `
+  (
+    SELECT COALESCE(SUM(COALESCE(qm."BaseAmount", qm."PlanAmount", qm."TotalAmount", 0)), 0)
+    FROM public."HealthInsuranceQuotationMember" qm
+    WHERE qm."HealthInsuranceQuotationCaseID" = ${caseIdExpr}
+      AND COALESCE(qm."IsDeleted", false) = false
+      AND COALESCE(qm."IsArchived", false) = false
+  )
+`;
 
 const buildMasterDateConditions = (dateFrom, dateTo, params) => {
   const conditions = [];
@@ -145,8 +217,8 @@ let executivesCache = { at: 0, rows: null };
 const EXEC_TTL_MS = 5 * 60 * 1000;
 
 /**
- * List real BRM (+ Admin) users by role NAME — same intent as BRM workbasket,
- * but GUID 05be3be5-… is wrong/stale in this DB (actual BRM role Id differs).
+ * List real BRM (+ Admin) users by role NAME â€” same intent as BRM workbasket,
+ * but GUID 05be3be5-â€¦ is wrong/stale in this DB (actual BRM role Id differs).
  */
 async function getExecutives({ includeAdmin = true } = {}) {
   const now = Date.now();
@@ -195,6 +267,18 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
   }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  const cacheKey =
+    `mgmt:brm:summaryCards:${(brmName || "all").toString()}:` +
+    `${dates.dateFrom}:${dates.dateTo}`;
+  if (redis) {
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch {
+      // ignore cache read errors
+    }
+  }
 
   const [bookedRows, pipelineRows, renRows] = await Promise.all([
     query(
@@ -277,17 +361,21 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
   const achievedRen = toNumber(p.AchievedBookedConfirmedRenewalPremium);
   const confirmedNew = toNumber(p.confirmedNewPremium);
   const confirmedRen = toNumber(r.confirmedRenewalPremium);
-  const achievedTotal = achievedNew + achievedRen;
+
+  // UI expects: Achieved (Booked + Confirmed pipeline)
+  const achievedNewTotal = achievedNew + confirmedNew;
+  const achievedRenTotal = achievedRen + confirmedRen;
+  const achievedTotal = achievedNewTotal + achievedRenTotal;
   const forecastTotal = achievedTotal + 0.6 * confirmedRen;
 
-  return {
+  const out = {
     ...booked,
     confirmedNewCount: toNumber(p.confirmedNewCount),
     confirmedRenewalCount: toNumber(p.confirmedRenewalCount),
     confirmedNewPremium: confirmedNew,
     confirmedRenewalPremium: confirmedRen,
-    AchievedBookedConfirmedNewPremium: achievedNew,
-    AchievedBookedConfirmedRenewalPremium: achievedRen,
+    AchievedBookedConfirmedNewPremium: achievedNewTotal,
+    AchievedBookedConfirmedRenewalPremium: achievedRenTotal,
     bookedCaseCount: toNumber(p.bookedCaseCount),
     openPipelineCount: toNumber(p.openPipelineCount),
     totalPipelineCases: toNumber(p.totalPipelineCases),
@@ -298,6 +386,16 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
     dateFrom: dates.dateFrom,
     dateTo: dates.dateTo,
   };
+
+  if (redis) {
+    try {
+      await redis.setex(cacheKey, SUMMARY_CARDS_CACHE_TTL_SEC, JSON.stringify(out));
+    } catch {
+      // ignore cache write failures
+    }
+  }
+
+  return out;
 }
 
 async function getSummaryList({
@@ -413,7 +511,7 @@ async function getSummaryList({
 }
 
 /**
- * New Business cases — ownership matches BRM master_data (caseDetailsList).
+ * New Business cases â€” ownership matches BRM master_data (caseDetailsList).
  * When executiveId set: no forced date filter (parity). Dates only if explicitly passed.
  */
 async function getCases({
@@ -459,7 +557,7 @@ async function getCases({
 
   const extraSql = extra.length ? `AND ${extra.join(" AND ")}` : "";
 
-  // Scoped to one BRM — identical to caseDetailsList core filters
+  // Scoped to one BRM â€” parity with BRM caseDetailsList (own)
   if (hasExec) {
     const filterParams = [...params];
     params.push(parsedLimit);
@@ -472,7 +570,13 @@ async function getCases({
         `
         WITH ${brokerUsersCteSql("$1")},
         scoped AS (
-          SELECT qc."ID", qc."DealStatus", qc."TargetPremium", qc."DisplayID"
+          SELECT
+            qc."ID",
+            qc."DealStatus",
+            qc."Status",
+            qc."DisplayID",
+            REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', '') AS base_display_id,
+            CAST(NULLIF(REGEXP_REPLACE(qc."DisplayID", '^.*-V([0-9]+)$', '\\1'), qc."DisplayID") AS INT) AS version_num
           FROM public."HealthInsuranceQuotationCase" qc
           LEFT JOIN public."User" u ON qc."CreatedByUserID" = u."ID"
           LEFT JOIN public."Company" c ON qc."ClientID" = c."ID"
@@ -480,19 +584,18 @@ async function getCases({
           ${extraSql}
         ),
         latest AS (
-          SELECT DISTINCT ON (REGEXP_REPLACE(s."DisplayID", '-V[0-9]+$', ''))
-            s."ID", s."DealStatus", s."TargetPremium"
-          FROM scoped s
-          ORDER BY REGEXP_REPLACE(s."DisplayID", '-V[0-9]+$', ''),
-                   CAST(NULLIF(REGEXP_REPLACE(s."DisplayID", '^.*-V([0-9]+)$', '\\1'), s."DisplayID") AS INT) DESC NULLS LAST
+          SELECT DISTINCT ON (base_display_id)
+            "ID", "DealStatus", "Status"
+          FROM scoped
+          ORDER BY base_display_id, version_num DESC NULLS LAST
         )
         SELECT
           COUNT(*)::int AS "totalCount",
           COUNT(*) FILTER (WHERE "DealStatus" = 2)::int AS "activeCount",
           COUNT(*) FILTER (WHERE "DealStatus" = 1)::int AS "hotCount",
-          COUNT(*) FILTER (WHERE "DealStatus" = 3)::int AS "wonCount",
-          COUNT(*) FILTER (WHERE "DealStatus" = 4)::int AS "lostCount",
-          COALESCE(SUM(COALESCE("TargetPremium", 0)), 0)::float AS "totalGrossPremium"
+          COUNT(*) FILTER (WHERE "Status" = 3)::int AS "wonCount",
+          COUNT(*) FILTER (WHERE "Status" = 4)::int AS "lostCount",
+          COALESCE(SUM(${memberGpSumSql('"ID"')}), 0)::float AS "totalGrossPremium"
         FROM latest
         `,
         filterParams,
@@ -505,7 +608,9 @@ async function getCases({
             qc."ID",
             qc."DisplayID",
             qc."DealStatus",
+            qc."Status",
             qc."TargetPremium",
+            qc."HealthInsuranceFormulaID",
             qc."BrokerCompanyName",
             qc."BrokerEmail",
             qc."QuotationPreparedBy",
@@ -546,6 +651,7 @@ async function getCases({
           l."ID",
           l."DisplayID",
           l."DealStatus",
+          l."Status" AS "case_status",
           l."TargetPremium",
           l."BrokerCompanyName",
           l."BrokerEmail",
@@ -561,25 +667,18 @@ async function getCases({
           l."broker_name",
           (SELECT COALESCE(NULLIF(TRIM(an."UserName"), ''), an."Email")
            FROM public."AspNetUsers" an WHERE an."Id" = $1 LIMIT 1) AS "brm_name",
-          brm."Status" AS "brm_status",
+          l."Status" AS "brm_status",
           brm."Priority" AS "brm_priority",
           brm."Potential" AS "brm_potential",
           brm."ConfirmStatus" AS "brm_confirm_status",
-          COALESCE(
-            NULLIF(${quotationMemberGpSql('l."ID"')}, 0),
-            l."TargetPremium",
-            0
-          )::float AS "gross_premium",
+          ${quotationMemberGpSql('l."ID"')}::float AS "gross_premium",
+          ${quotationMemberNetSql('l."ID"', 'l."HealthInsuranceFormulaID"')}::float AS "net_premium",
           (
-            COALESCE(
-              NULLIF(${quotationMemberGpSql('l."ID"')}, 0),
-              l."TargetPremium",
-              0
-            ) - COALESCE(l."TargetPremium", 0)
+            ${quotationMemberGpSql('l."ID"')} - COALESCE(l."TargetPremium", 0)
           )::float AS "difference"
         FROM latest l
         LEFT JOIN LATERAL (
-          SELECT b."Status", b."Priority", b."Potential", b."ConfirmStatus"
+          SELECT b."Priority", b."Potential", b."ConfirmStatus"
           FROM public."BrmCaseActionsUpdates" b
           WHERE b."CaseID" = l."ID"
           ORDER BY b."UpdatedAt" DESC NULLS LAST
@@ -609,10 +708,10 @@ async function getCases({
     };
   }
 
-  // All BRMs — open B-cases only (management global). Optional dates.
+  // All BRMs â€” open B/D cases, latest version only
   params.length = 0;
   const allExtra = [
-    `qc."DisplayID" ~ '-B[0-9]+'`,
+    `qc."DisplayID" ~ '-[BD][0-9]+'`,
     `qc."BookingStatus" IS false`,
   ];
   if (dates.dateFrom) {
@@ -634,95 +733,147 @@ async function getCases({
       `(qc."DisplayID" ILIKE ${p} OR qc."BrokerCompanyName" ILIKE ${p} OR c."Name" ILIKE ${p})`,
     );
   }
-  const whereAll = `WHERE ${allExtra.join(" AND ")}`;
-  const filterParams = [...params];
+  const whereAll = allExtra.join(" AND ");
+  const filterParamsAll = [...params];
   params.push(parsedLimit);
-  const limitIdx = params.length;
+  const limitIdxAll = params.length;
   params.push(parsedOffset);
-  const offsetIdx = params.length;
+  const offsetIdxAll = params.length;
 
-  const [aggRows, caseRows] = await Promise.all([
+  const [aggRowsAll, caseRowsAll] = await Promise.all([
     query(
-      `SELECT
-         COUNT(*)::int AS "totalCount",
-         COUNT(*) FILTER (WHERE qc."DealStatus" = 2)::int AS "activeCount",
-         COUNT(*) FILTER (WHERE qc."DealStatus" = 1)::int AS "hotCount",
-         COUNT(*) FILTER (WHERE qc."DealStatus" = 3)::int AS "wonCount",
-         COUNT(*) FILTER (WHERE qc."DealStatus" = 4)::int AS "lostCount",
-         COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float AS "totalGrossPremium"
-       FROM public."HealthInsuranceQuotationCase" qc
-       LEFT JOIN public."Company" c ON qc."ClientID" = c."ID"
-       ${whereAll}`,
-      filterParams,
+      `
+      WITH scoped AS (
+        SELECT
+          qc."ID",
+          qc."DealStatus",
+          qc."Status",
+          qc."DisplayID",
+          REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', '') AS base_display_id,
+          CAST(NULLIF(REGEXP_REPLACE(qc."DisplayID", '^.*-V([0-9]+)$', '\\1'), qc."DisplayID") AS INT) AS version_num
+        FROM public."HealthInsuranceQuotationCase" qc
+        LEFT JOIN public."Company" c ON qc."ClientID" = c."ID"
+        WHERE ${whereAll}
+      ),
+      latest AS (
+        SELECT DISTINCT ON (base_display_id)
+          "ID", "DealStatus", "Status"
+        FROM scoped
+        ORDER BY base_display_id, version_num DESC NULLS LAST
+      )
+      SELECT
+        COUNT(*)::int AS "totalCount",
+        COUNT(*) FILTER (WHERE "DealStatus" = 2)::int AS "activeCount",
+        COUNT(*) FILTER (WHERE "DealStatus" = 1)::int AS "hotCount",
+        COUNT(*) FILTER (WHERE "Status" = 3)::int AS "wonCount",
+        COUNT(*) FILTER (WHERE "Status" = 4)::int AS "lostCount",
+        COALESCE(SUM(${memberGpSumSql('"ID"')}), 0)::float AS "totalGrossPremium"
+      FROM latest
+      `,
+      filterParamsAll,
     ),
     query(
-      `SELECT
-         qc."ID", qc."DisplayID", qc."DealStatus", qc."TargetPremium",
-         qc."BrokerCompanyName", qc."BrokerEmail", qc."QuotationPreparedBy",
-         qc."AssignedBrmExecutive", qc."ReferenceNumber", qc."Insurer",
-         CASE WHEN qc."DisplayID" ~* '-I[0-9]+' THEN 'Individual' ELSE 'Group' END AS "policy_type",
-         (
-           SELECT STRING_AGG(
-             DISTINCT REGEXP_REPLACE(TRIM(cat."HealthInsurancePlanName"), '[^a-zA-Z0-9 _]+$', ''),
-             ', '
-           )
-           FROM public."HealthInsuranceQuotationCategory" cat
-           WHERE cat."HealthInsuranceQuotationCaseID" = qc."ID"
-             AND TRIM(COALESCE(cat."HealthInsurancePlanName", '')) <> ''
-         ) AS "category_plan_name",
-         TO_CHAR(qc."PolicyEffectiveDate", 'DD-MM-YYYY') AS "PolicyEffectiveDate",
-         TO_CHAR(qc."CreateDate", 'DD-MM-YYYY') AS "CreateDate",
-         c."Name" AS "client_name",
-         (
-           SELECT COALESCE(NULLIF(TRIM(bru."UserName"), ''), bru."Email")
-           FROM public."User" broker
-           JOIN public."UserBrokerMapping" ubm ON ubm."CompanyId" = broker."CompanyID"
-           JOIN public."AspNetUsers" bru ON bru."Id" = ubm."UserId"
-           WHERE broker."ID" = qc."CreatedByUserID"
-           LIMIT 1
-         ) AS "brm_name",
-         brm."Status" AS "brm_status",
-         brm."Priority" AS "brm_priority",
-         brm."Potential" AS "brm_potential",
-         brm."ConfirmStatus" AS "brm_confirm_status",
-         COALESCE(
-           NULLIF(${quotationMemberGpSql('qc."ID"')}, 0),
-           qc."TargetPremium", 0
-         )::float AS "gross_premium",
-         (
-           COALESCE(
-             NULLIF(${quotationMemberGpSql('qc."ID"')}, 0),
-             qc."TargetPremium", 0
-           ) - COALESCE(qc."TargetPremium", 0)
-         )::float AS "difference"
-       FROM public."HealthInsuranceQuotationCase" qc
-       LEFT JOIN public."Company" c ON qc."ClientID" = c."ID"
-       LEFT JOIN LATERAL (
-         SELECT b."Status", b."Priority", b."Potential", b."ConfirmStatus"
-         FROM public."BrmCaseActionsUpdates" b
-         WHERE b."CaseID" = qc."ID"
-         ORDER BY b."UpdatedAt" DESC NULLS LAST
-         LIMIT 1
-       ) brm ON TRUE
-       ${whereAll}
-       ORDER BY qc."ID" DESC
-       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      `
+      WITH scoped AS (
+        SELECT
+          qc."ID",
+          qc."DisplayID",
+          qc."DealStatus",
+          qc."Status",
+          qc."TargetPremium",
+          qc."HealthInsuranceFormulaID",
+          qc."BrokerCompanyName",
+          qc."BrokerEmail",
+          qc."QuotationPreparedBy",
+          qc."AssignedBrmExecutive",
+          qc."ReferenceNumber",
+          qc."Insurer",
+          qc."PolicyEffectiveDate",
+          qc."CreateDate",
+          c."Name" AS "client_name",
+          CASE WHEN qc."DisplayID" ~* '-I[0-9]+' THEN 'Individual' ELSE 'Group' END AS "policy_type",
+          (
+            SELECT STRING_AGG(
+              DISTINCT REGEXP_REPLACE(TRIM(cat."HealthInsurancePlanName"), '[^a-zA-Z0-9 _]+$', ''),
+              ', '
+            )
+            FROM public."HealthInsuranceQuotationCategory" cat
+            WHERE cat."HealthInsuranceQuotationCaseID" = qc."ID"
+              AND TRIM(COALESCE(cat."HealthInsurancePlanName", '')) <> ''
+          ) AS "category_plan_name",
+          (
+            SELECT COALESCE(NULLIF(TRIM(bru."UserName"), ''), bru."Email")
+            FROM public."User" broker
+            JOIN public."UserBrokerMapping" ubm ON ubm."CompanyId" = broker."CompanyID"
+            JOIN public."AspNetUsers" bru ON bru."Id" = ubm."UserId"
+            WHERE broker."ID" = qc."CreatedByUserID"
+            LIMIT 1
+          ) AS "brm_name",
+          REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', '') AS base_display_id,
+          CAST(NULLIF(REGEXP_REPLACE(qc."DisplayID", '^.*-V([0-9]+)$', '\\1'), qc."DisplayID") AS INT) AS version_num
+        FROM public."HealthInsuranceQuotationCase" qc
+        LEFT JOIN public."Company" c ON qc."ClientID" = c."ID"
+        WHERE ${whereAll}
+      ),
+      latest AS (
+        SELECT DISTINCT ON (base_display_id) *
+        FROM scoped
+        ORDER BY base_display_id, version_num DESC NULLS LAST
+      )
+      SELECT
+        l."ID",
+        l."DisplayID",
+        l."DealStatus",
+        l."Status" AS "case_status",
+        l."TargetPremium",
+        l."BrokerCompanyName",
+        l."BrokerEmail",
+        l."QuotationPreparedBy",
+        l."AssignedBrmExecutive",
+        l."ReferenceNumber",
+        l."Insurer",
+        l."policy_type",
+        l."category_plan_name",
+        TO_CHAR(l."PolicyEffectiveDate", 'DD-MM-YYYY') AS "PolicyEffectiveDate",
+        TO_CHAR(l."CreateDate", 'DD-MM-YYYY') AS "CreateDate",
+        l."client_name",
+        l."brm_name",
+        l."Status" AS "brm_status",
+        brm."Priority" AS "brm_priority",
+        brm."Potential" AS "brm_potential",
+        brm."ConfirmStatus" AS "brm_confirm_status",
+        ${quotationMemberGpSql('l."ID"')}::float AS "gross_premium",
+        ${quotationMemberNetSql('l."ID"', 'l."HealthInsuranceFormulaID"')}::float AS "net_premium",
+        (
+          ${quotationMemberGpSql('l."ID"')} - COALESCE(l."TargetPremium", 0)
+        )::float AS "difference"
+      FROM latest l
+      LEFT JOIN LATERAL (
+        SELECT b."Priority", b."Potential", b."ConfirmStatus"
+        FROM public."BrmCaseActionsUpdates" b
+        WHERE b."CaseID" = l."ID"
+        ORDER BY b."UpdatedAt" DESC NULLS LAST
+        LIMIT 1
+      ) brm ON TRUE
+      ORDER BY l."ID" DESC
+      LIMIT $${limitIdxAll} OFFSET $${offsetIdxAll}
+      `,
       params,
     ),
   ]);
 
-  const agg = aggRows[0] || {};
+  const aggAll = aggRowsAll[0] || {};
   return {
-    cases: caseRows,
-    totalCount: toNumber(agg.totalCount),
-    activeCount: toNumber(agg.activeCount),
-    hotCount: toNumber(agg.hotCount),
-    wonCount: toNumber(agg.wonCount),
-    lostCount: toNumber(agg.lostCount),
-    totalGrossPremium: toNumber(agg.totalGrossPremium),
+    cases: caseRowsAll,
+    totalCount: toNumber(aggAll.totalCount),
+    activeCount: toNumber(aggAll.activeCount),
+    hotCount: toNumber(aggAll.hotCount),
+    wonCount: toNumber(aggAll.wonCount),
+    lostCount: toNumber(aggAll.lostCount),
+    totalGrossPremium: toNumber(aggAll.totalGrossPremium),
     limit: parsedLimit,
     offset: parsedOffset,
-    ownership: "all_open_b_cases",
+    ownership: "all_open_bd_cases",
     dateFrom: dates.dateFrom,
     dateTo: dates.dateTo,
   };
@@ -730,7 +881,7 @@ async function getCases({
 
 
 /**
- * Per-BRM ranking — same ownership as BRM master_data (no forced date unless passed).
+ * Per-BRM ranking â€” same ownership as BRM master_data (no forced date unless passed).
  */
 async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
   const dates = optionalDates({ dateFrom, dateTo });
@@ -768,34 +919,34 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
       ORDER BY an."Id", r."Name"
     ),
     open_raw AS (
-      SELECT DISTINCT bu."Id" AS executive_id, qc."ID" AS case_id, qc."DealStatus", qc."TargetPremium", qc."DisplayID"
+      SELECT DISTINCT bu."Id" AS executive_id, qc."ID" AS case_id, qc."DealStatus", qc."Status", qc."DisplayID"
       FROM brm_users bu
       JOIN public."UserBrokerMapping" ubm ON ubm."UserId" = bu."Id"
       JOIN public."User" broker ON broker."CompanyID" = ubm."CompanyId"
       JOIN public."HealthInsuranceQuotationCase" qc ON qc."CreatedByUserID" = broker."ID"
-      WHERE qc."DisplayID" ~ '-B[0-9]+'
+      WHERE qc."DisplayID" ~ '-[BD][0-9]+'
         AND qc."BookingStatus" IS false
         ${openDateFilter}
     ),
     open_latest AS (
       SELECT DISTINCT ON (executive_id, REGEXP_REPLACE("DisplayID", '-V[0-9]+$', ''))
-        executive_id, case_id, "DealStatus", "TargetPremium"
+        executive_id, case_id, "DealStatus", "Status"
       FROM open_raw
       ORDER BY executive_id, REGEXP_REPLACE("DisplayID", '-V[0-9]+$', ''), case_id DESC
     ),
     booked_raw AS (
-      SELECT DISTINCT bu."Id" AS executive_id, qc."ID" AS case_id, qc."TargetPremium", qc."DisplayID"
+      SELECT DISTINCT bu."Id" AS executive_id, qc."ID" AS case_id, qc."DisplayID"
       FROM brm_users bu
       JOIN public."UserBrokerMapping" ubm ON ubm."UserId" = bu."Id"
       JOIN public."User" broker ON broker."CompanyID" = ubm."CompanyId"
       JOIN public."HealthInsuranceQuotationCase" qc ON qc."CreatedByUserID" = broker."ID"
-      WHERE qc."DisplayID" ~ '-B[0-9]+'
+      WHERE qc."DisplayID" ~ '-[BD][0-9]+'
         AND qc."BookingStatus" IS true
         ${bookedDateFilter}
     ),
     booked_latest AS (
       SELECT DISTINCT ON (executive_id, REGEXP_REPLACE("DisplayID", '-V[0-9]+$', ''))
-        executive_id, case_id, "TargetPremium"
+        executive_id, case_id
       FROM booked_raw
       ORDER BY executive_id, REGEXP_REPLACE("DisplayID", '-V[0-9]+$', ''), case_id DESC
     ),
@@ -805,9 +956,9 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
         COUNT(*)::int AS "newCaseTotal",
         COUNT(*) FILTER (WHERE "DealStatus" = 2)::int AS "activeCases",
         COUNT(*) FILTER (WHERE "DealStatus" = 1)::int AS "hotCases",
-        COUNT(*) FILTER (WHERE "DealStatus" = 3)::int AS "wonCases",
-        COUNT(*) FILTER (WHERE "DealStatus" = 4)::int AS "lostCases",
-        COALESCE(SUM(COALESCE("TargetPremium", 0)), 0)::float AS "openPremium"
+        COUNT(*) FILTER (WHERE "Status" = 3)::int AS "wonCases",
+        COUNT(*) FILTER (WHERE "Status" = 4)::int AS "lostCases",
+        COALESCE(SUM(${memberGpSumSql("case_id")}), 0)::float AS "openPremium"
       FROM open_latest
       GROUP BY executive_id
     ),
@@ -815,7 +966,7 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
       SELECT
         executive_id,
         COUNT(*)::int AS "bookedCaseTotal",
-        COALESCE(SUM(COALESCE("TargetPremium", 0)), 0)::float AS "bookedPremium"
+        COALESCE(SUM(${memberGpSumSql("case_id")}), 0)::float AS "bookedPremium"
       FROM booked_latest
       GROUP BY executive_id
     ),
@@ -954,7 +1105,7 @@ async function getTrends({ period = "monthly", executiveId, dateFrom, dateTo } =
              COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float AS "nbBookedPremium",
              0::float AS "renBookedPremium"
       FROM public."HealthInsuranceQuotationCase" qc
-      WHERE qc."DisplayID" ~ '-B[0-9]+'
+      WHERE qc."DisplayID" ~ '-[BD][0-9]+'
         AND qc."BookingStatus" IS false
         AND qc."CreateDate"::date BETWEEN $1::date AND $2::date
       GROUP BY 1 ORDER BY 1 ASC`;
@@ -1065,7 +1216,7 @@ async function getRenewals({
   const offsetIdx = params.length;
 
   // Same as BRM BrokerCaseDetailsService.renewalMasterDataLateralJoin:
-  // EndorsementTypeCode = '02' + PolicyList → TechnicalSheetNumber match.
+  // EndorsementTypeCode = '02' + PolicyList â†’ TechnicalSheetNumber match.
   // Displayed Expiring Premium = stored column, fallback MasterData SUM(GrossPremium).
   const renewalMasterDataLateralJoin = `
     LEFT JOIN LATERAL (
@@ -1190,7 +1341,7 @@ async function getCompare({
 }
 
 /**
- * Fast overview — NO MasterDataLayer for pipeline (that stays on All Summary for booked production).
+ * Fast overview â€” NO MasterDataLayer for pipeline (that stays on All Summary for booked production).
  * Pipeline uses BRM master_data ownership (broker mapping + DisplayID -B + open).
  * Dates optional when filtering a BRM (parity); defaults only for global trend chart.
  * Supports dealStatus + period for the new Management Overview UI.
@@ -1253,7 +1404,7 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
     `;
   } else {
     const dateConds = [
-      `qc."DisplayID" ~ '-B[0-9]+'`,
+      `qc."DisplayID" ~ '-[BD][0-9]+'`,
       `qc."BookingStatus" IS false`,
     ];
     if (opt.dateFrom) {
@@ -1368,13 +1519,13 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
     insights.push({
       type: "top_performer",
       title: "Top BRM by target premium",
-      detail: `${topBrms[0].executiveName} · ${formatInt(topBrms[0].totalCases)} cases · AED ${Math.round(toNumber(topBrms[0].totalGrossPremium)).toLocaleString()}`,
+      detail: `${topBrms[0].executiveName} Â· ${formatInt(topBrms[0].totalCases)} cases Â· AED ${Math.round(toNumber(topBrms[0].totalGrossPremium)).toLocaleString()}`,
     });
   }
   insights.push({
     type: "pipeline",
     title: "Open pipeline (master_data parity)",
-    detail: `${toNumber(p.openCount)} open B-cases · Hot ${toNumber(p.hotCount)} · Active ${toNumber(p.activeCount)}`,
+    detail: `${toNumber(p.openCount)} open B-cases Â· Hot ${toNumber(p.hotCount)} Â· Active ${toNumber(p.activeCount)}`,
   });
   const lowWin = topBrms
     .filter((e) => e.winRate != null && toNumber(e.wonCases) + toNumber(e.lostCases) >= 3)
