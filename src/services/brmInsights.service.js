@@ -125,16 +125,18 @@ const query = async (sql, params = []) => {
   return serialize(rows);
 };
 
-/** Soft default for MasterDataLayer-heavy queries only (All Summary cards) */
+/** Soft default = current calendar month (All Summary / dashboard parity) */
 const withDefaultDates = ({ dateFrom, dateTo } = {}) => {
-  const to = dateTo || new Date().toISOString().slice(0, 10);
-  let from = dateFrom;
-  if (!from) {
-    const d = new Date();
-    d.setFullYear(d.getFullYear() - 1);
-    from = d.toISOString().slice(0, 10);
-  }
-  return { dateFrom: from, dateTo: to };
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const monthStart = `${y}-${String(m + 1).padStart(2, "0")}-01`;
+  const lastDay = new Date(y, m + 1, 0).getDate();
+  const monthEnd = `${y}-${String(m + 1).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+  return {
+    dateFrom: dateFrom && String(dateFrom).trim() ? String(dateFrom).trim() : monthStart,
+    dateTo: dateTo && String(dateTo).trim() ? String(dateTo).trim() : monthEnd,
+  };
 };
 
 /** Optional dates â€” empty means no date filter (BRM master_data parity) */
@@ -280,7 +282,10 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
     }
   }
 
-  const [bookedRows, pipelineRows, renRows] = await Promise.all([
+  // Booked = MasterDataLayer (date-filtered). Confirmed pipeline matches BRM All Summary:
+  // NB = HealthInsuranceQuotationCase DealStatus=2 not booked (latest version);
+  // RN = BrmRenewalData Distributed + BrmActionStatus=2 (no date filter on open pipeline).
+  const [bookedRows, pipelineRows] = await Promise.all([
     query(
       `
       SELECT
@@ -310,15 +315,27 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
         COALESCE(SUM("GrossPremium") FILTER (
           WHERE COALESCE("EventNbr"::int, 1) <> 1 AND LOWER(TRIM("PolicyType")) = 'individual'
         ), 0)::float AS "endIndividualPremium",
-        COUNT(*) FILTER (
+        COUNT(DISTINCT "TechnicalSheetNumber") FILTER (
           WHERE UPPER(TRIM("NewOrRenewal")) = 'NEW' AND COALESCE("EventNbr"::int, 1) = 1
         )::int AS "nbCount",
-        COUNT(*) FILTER (
+        COUNT(DISTINCT "TechnicalSheetNumber") FILTER (
           WHERE UPPER(TRIM("NewOrRenewal")) = 'RENEWAL' AND COALESCE("EventNbr"::int, 1) = 1
         )::int AS "renCount",
-        COUNT(*) FILTER (WHERE COALESCE("EventNbr"::int, 1) <> 1)::int AS "endCount",
-        COUNT(*)::int AS "totalCount",
-        COALESCE(SUM("GrossPremium"), 0)::float AS "totalPremium"
+        COUNT(DISTINCT "TechnicalSheetNumber") FILTER (
+          WHERE COALESCE("EventNbr"::int, 1) <> 1
+        )::int AS "endCount",
+        COUNT(DISTINCT "TechnicalSheetNumber")::int AS "totalCount",
+        (
+          COALESCE(SUM("GrossPremium") FILTER (
+            WHERE UPPER(TRIM("NewOrRenewal")) = 'NEW' AND COALESCE("EventNbr"::int, 1) = 1
+          ), 0)
+          + COALESCE(SUM("GrossPremium") FILTER (
+            WHERE UPPER(TRIM("NewOrRenewal")) = 'RENEWAL' AND COALESCE("EventNbr"::int, 1) = 1
+          ), 0)
+          + COALESCE(SUM("GrossPremium") FILTER (
+            WHERE COALESCE("EventNbr"::int, 1) <> 1
+          ), 0)
+        )::float AS "totalPremium"
       FROM public."MasterDataLayer"
       ${whereClause}
       `,
@@ -327,46 +344,98 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
     query(
       `
       SELECT
-        COUNT(*) FILTER (WHERE qc."DealStatus" = 2 AND qc."BookingStatus" IS NOT TRUE)::int AS "confirmedNewCount",
-        COUNT(*) FILTER (WHERE qc."DealStatus" = 1 AND qc."BookingStatus" IS NOT TRUE)::int AS "confirmedRenewalCount",
-        COUNT(*) FILTER (WHERE qc."BookingStatus" IS TRUE AND qc."RenewalFromCaseID" IS NULL)::int AS "achievedNewCount",
-        COUNT(*) FILTER (WHERE qc."BookingStatus" IS TRUE AND qc."RenewalFromCaseID" > 0)::int AS "achievedRenCount",
-        COUNT(*) FILTER (WHERE qc."BookingStatus" IS TRUE)::int AS "bookedCaseCount",
-        COUNT(*) FILTER (WHERE qc."BookingStatus" IS NOT TRUE)::int AS "openPipelineCount",
-        COUNT(*)::int AS "totalPipelineCases",
-        COALESCE(SUM(CASE WHEN qc."BookingStatus" IS TRUE THEN COALESCE(qc."TargetPremium", 0) ELSE 0 END), 0)::float AS "achievedTargetPremium",
-        COALESCE(SUM(CASE WHEN qc."DealStatus" = 2 AND qc."BookingStatus" IS NOT TRUE THEN COALESCE(qc."TargetPremium", 0) ELSE 0 END), 0)::float AS "confirmedNewPremium",
-        COALESCE(SUM(CASE WHEN qc."BookingStatus" IS TRUE AND qc."RenewalFromCaseID" IS NULL THEN COALESCE(qc."TargetPremium", 0) ELSE 0 END), 0)::float AS "AchievedBookedConfirmedNewPremium",
-        COALESCE(SUM(CASE WHEN qc."BookingStatus" IS TRUE AND qc."RenewalFromCaseID" > 0 THEN COALESCE(qc."TargetPremium", 0) ELSE 0 END), 0)::float AS "AchievedBookedConfirmedRenewalPremium"
-      FROM public."HealthInsuranceQuotationCase" qc
-      WHERE qc."CreateDate"::date BETWEEN $1::date AND $2::date
+        (
+          SELECT COUNT(*)::int
+          FROM (
+            SELECT DISTINCT ON (REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''))
+              qc."ID"
+            FROM public."HealthInsuranceQuotationCase" qc
+            WHERE qc."BookingStatus" IS false
+              AND qc."DisplayID" ~ '-[BI][0-9]+'
+              AND qc."DealStatus" = 2
+            ORDER BY REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''), qc."ID" DESC
+          ) t
+        ) AS "confirmedNewCount",
+        (
+          SELECT COUNT(*)::int
+          FROM public."BrmRenewalData" brd
+          WHERE brd."BatchStatus" = 'Distributed'
+            AND brd."BrmActionStatus" = 2
+        ) AS "confirmedRenewalCount",
+        (
+          SELECT COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float
+          FROM (
+            SELECT DISTINCT ON (REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''))
+              qc."ID", qc."TargetPremium"
+            FROM public."HealthInsuranceQuotationCase" qc
+            WHERE qc."BookingStatus" IS false
+              AND qc."DisplayID" ~ '-[BI][0-9]+'
+              AND qc."DealStatus" = 2
+            ORDER BY REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''), qc."ID" DESC
+          ) qc
+        ) AS "confirmedNewPremium",
+        (
+          SELECT COALESCE(SUM(
+            COALESCE(NULLIF(brd."ExpiringPremium"::float, 0), mp.total_premium, 0)
+          ), 0)::float
+          FROM public."BrmRenewalData" brd
+          LEFT JOIN LATERAL (
+            SELECT COALESCE(SUM(m."GrossPremium"), 0)::float AS total_premium
+            FROM public."MasterDataLayer" m
+            WHERE m."EndorsementTypeCode" = '02'
+              AND m."TechnicalSheetNumber"::text = ANY(
+                ARRAY(
+                  SELECT TRIM(val)
+                  FROM unnest(string_to_array(REPLACE(COALESCE(brd."PolicyList", ''), ' ', ''), ',')) AS val
+                  WHERE TRIM(val) <> ''
+                )
+              )
+          ) mp ON TRUE
+          WHERE brd."BatchStatus" = 'Distributed'
+            AND brd."BrmActionStatus" = 2
+        ) AS "confirmedRenewalPremium",
+        (
+          SELECT COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float
+          FROM (
+            SELECT DISTINCT ON (REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''))
+              qc."ID", qc."TargetPremium", qc."RenewalFromCaseID"
+            FROM public."HealthInsuranceQuotationCase" qc
+            WHERE qc."BookingStatus" IS true
+              AND qc."DisplayID" ~ '-[BI][0-9]+'
+            ORDER BY REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''), qc."ID" DESC
+          ) qc
+          WHERE qc."RenewalFromCaseID" IS NULL OR qc."RenewalFromCaseID" = 0
+        ) AS "AchievedBookedConfirmedNewPremium",
+        (
+          SELECT COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float
+          FROM (
+            SELECT DISTINCT ON (REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''))
+              qc."ID", qc."TargetPremium", qc."RenewalFromCaseID"
+            FROM public."HealthInsuranceQuotationCase" qc
+            WHERE qc."BookingStatus" IS true
+              AND qc."DisplayID" ~ '-[BI][0-9]+'
+            ORDER BY REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''), qc."ID" DESC
+          ) qc
+          WHERE qc."RenewalFromCaseID" IS NOT NULL AND qc."RenewalFromCaseID" > 0
+        ) AS "AchievedBookedConfirmedRenewalPremium"
       `,
-      [dates.dateFrom, dates.dateTo],
-    ),
-    query(
-      `SELECT COALESCE(SUM("ExpiringPremium") FILTER (WHERE "BrmActionStatus" = 2), 0)::float AS "confirmedRenewalPremium",
-              COUNT(*) FILTER (WHERE "BatchStatus" = 'Distributed')::int AS "renewalBatchCount",
-              COUNT(*) FILTER (WHERE "BrmActionStatus" = 2)::int AS "renewalConfirmedCount"
-       FROM public."BrmRenewalData"
-       WHERE ("EffectiveDate" IS NULL OR "EffectiveDate"::date BETWEEN $1::date AND $2::date)`,
-      [dates.dateFrom, dates.dateTo],
     ),
   ]);
 
   const booked = bookedRows[0] || {};
   const p = pipelineRows[0] || {};
-  const r = renRows[0] || {};
 
-  const achievedNew = toNumber(p.AchievedBookedConfirmedNewPremium);
-  const achievedRen = toNumber(p.AchievedBookedConfirmedRenewalPremium);
   const confirmedNew = toNumber(p.confirmedNewPremium);
-  const confirmedRen = toNumber(r.confirmedRenewalPremium);
-
-  // UI expects: Achieved (Booked + Confirmed pipeline)
-  const achievedNewTotal = achievedNew + confirmedNew;
-  const achievedRenTotal = achievedRen + confirmedRen;
-  const achievedTotal = achievedNewTotal + achievedRenTotal;
-  const forecastTotal = achievedTotal + 0.6 * confirmedRen;
+  const confirmedRen = toNumber(p.confirmedRenewalPremium);
+  // Same as BRM: Achieved quotation booked TargetPremium + open confirmed pipeline
+  const achievedNewTotal =
+    toNumber(p.AchievedBookedConfirmedNewPremium) + confirmedNew;
+  const achievedRenTotal =
+    toNumber(p.AchievedBookedConfirmedRenewalPremium) + confirmedRen;
+  const endPremium =
+    toNumber(booked.endGroupPremium) + toNumber(booked.endIndividualPremium);
+  const achievedTotal = achievedNewTotal + achievedRenTotal + endPremium;
+  const forecastTotal = achievedTotal + 0.6 * (confirmedNew + confirmedRen);
 
   const out = {
     ...booked,
@@ -376,11 +445,6 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
     confirmedRenewalPremium: confirmedRen,
     AchievedBookedConfirmedNewPremium: achievedNewTotal,
     AchievedBookedConfirmedRenewalPremium: achievedRenTotal,
-    bookedCaseCount: toNumber(p.bookedCaseCount),
-    openPipelineCount: toNumber(p.openPipelineCount),
-    totalPipelineCases: toNumber(p.totalPipelineCases),
-    renewalBatchCount: toNumber(r.renewalBatchCount),
-    renewalConfirmedCount: toNumber(r.renewalConfirmedCount),
     achievedTotal,
     forecastTotal,
     dateFrom: dates.dateFrom,
