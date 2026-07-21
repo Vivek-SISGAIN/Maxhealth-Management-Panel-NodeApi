@@ -6,21 +6,27 @@ const router = Router();
 
 // ─── Transformers ─────────────────────────────────────────────────────────────
 
-const transformTask = (task) => ({
-  id: task.Id,
-  taskType: task.TaskType,
-  caseId: task.CaseId,
-  policyId: task.PolicyId,
-  assignedTo: task.AssignedTo,
-  priority: task.Priority,
-  status: task.Status,
-  slaDeadline: task.SlaDeadline,
-  slaBreach: task.SlaBreach,
-  metadata: task.Metadata,
-  createdAt: task.CreatedAt,
-  updatedAt: task.UpdatedAt,
-  completedAt: task.CompletedAt,
-});
+const transformTask = (task) => {
+  const created = task.CreatedAt ? new Date(task.CreatedAt).getTime() : null;
+  const ageDays =
+    created != null ? Math.max(0, Math.round((Date.now() - created) / 86400000)) : null;
+  return {
+    id: task.Id,
+    taskType: task.TaskType,
+    caseId: task.CaseId,
+    policyId: task.PolicyId,
+    assignedTo: task.AssignedTo,
+    priority: task.Priority,
+    status: task.SlaBreach ? "SLA_BREACH" : task.Status,
+    slaDeadline: task.SlaDeadline,
+    slaBreach: task.SlaBreach,
+    ageDays,
+    metadata: task.Metadata,
+    createdAt: task.CreatedAt,
+    updatedAt: task.UpdatedAt,
+    completedAt: task.CompletedAt,
+  };
+};
 
 const transformUnderwritingCase = (uc) => ({
   id: uc.Id,
@@ -55,9 +61,12 @@ const enrichCase = async (uc) => {
     where: { CaseId: uc.Id },
   });
 
-  // Find linked task to get workbench data
+  // Find linked task — CaseId on MedicalTask may be UUID Id or business CaseId
   const task = await prisma.medicalTask.findFirst({
-    where: { CaseId: uc.Id, TaskType: "UNDERWRITING" },
+    where: {
+      TaskType: "UNDERWRITING",
+      OR: [{ CaseId: uc.Id }, { CaseId: uc.CaseId }],
+    },
     orderBy: { UpdatedAt: "desc" },
   });
 
@@ -85,7 +94,10 @@ router.get("/cases", async (req, res) => {
       result,
       policyType,
       broker,
+      assignedDoctor,
       search,
+      dateFrom,
+      dateTo,
       page = "1",
       limit = "20",
     } = req.query;
@@ -98,11 +110,25 @@ router.get("/cases", async (req, res) => {
     if (result) where.Result = result;
     if (policyType) where.PolicyType = policyType;
     if (broker) where.Broker = { contains: broker, mode: "insensitive" };
+    if (assignedDoctor) {
+      if (assignedDoctor === "unassigned") where.AssignedDoctor = null;
+      else where.AssignedDoctor = { contains: assignedDoctor, mode: "insensitive" };
+    }
+    if (dateFrom || dateTo) {
+      where.CreatedAt = {};
+      if (dateFrom) where.CreatedAt.gte = new Date(dateFrom);
+      if (dateTo) {
+        const to = new Date(dateTo);
+        to.setHours(23, 59, 59, 999);
+        where.CreatedAt.lte = to;
+      }
+    }
     if (search) {
       where.OR = [
         { CaseId: { contains: search, mode: "insensitive" } },
         { Client: { contains: search, mode: "insensitive" } },
         { Broker: { contains: search, mode: "insensitive" } },
+        { AssignedDoctor: { contains: search, mode: "insensitive" } },
       ];
     }
 
@@ -177,9 +203,11 @@ router.get("/cases/stats", async (req, res) => {
  */
 router.get("/cases/:id", async (req, res) => {
   try {
-    const uc = await prisma.underwritingCase.findUnique({
-      where: { Id: req.params.id },
-    });
+    const id = req.params.id;
+    let uc = await prisma.underwritingCase.findUnique({ where: { Id: id } });
+    if (!uc) {
+      uc = await prisma.underwritingCase.findFirst({ where: { CaseId: id } });
+    }
     if (!uc) {
       return res.status(404).json({ success: false, message: "Case not found" });
     }
@@ -220,8 +248,15 @@ router.get("/cases/:id/members", async (req, res) => {
  */
 router.get("/cases/:id/workbench", async (req, res) => {
   try {
+    const id = req.params.id;
+    const uc = await prisma.underwritingCase.findFirst({
+      where: { OR: [{ Id: id }, { CaseId: id }] },
+      select: { Id: true, CaseId: true },
+    });
+    const caseRefs = uc ? [uc.Id, uc.CaseId].filter(Boolean) : [id];
+
     const task = await prisma.medicalTask.findFirst({
-      where: { CaseId: req.params.id, TaskType: "UNDERWRITING" },
+      where: { TaskType: "UNDERWRITING", CaseId: { in: caseRefs } },
       orderBy: { UpdatedAt: "desc" },
     });
 
@@ -333,10 +368,11 @@ router.get("/tasks", async (req, res) => {
 
     const where = {};
     if (taskType) where.TaskType = taskType;
-    if (status) where.Status = status;
+    if (status === "SLA_BREACH") where.SlaBreach = true;
+    else if (status) where.Status = status;
     if (priority) where.Priority = priority;
-    if (caseId) where.CaseId = caseId;
-    if (assignedTo) where.AssignedTo = assignedTo;
+    if (caseId) where.CaseId = { contains: String(caseId), mode: "insensitive" };
+    if (assignedTo) where.AssignedTo = { contains: String(assignedTo), mode: "insensitive" };
     if (slaBreach !== undefined) where.SlaBreach = slaBreach === "true";
 
     const [tasks, count] = await Promise.all([
@@ -349,9 +385,28 @@ router.get("/tasks", async (req, res) => {
       prisma.medicalTask.count({ where }),
     ]);
 
+    const caseRefs = [...new Set(tasks.map((t) => t.CaseId).filter(Boolean))];
+    const caseIdMap = new Map();
+    if (caseRefs.length) {
+      const linked = await prisma.underwritingCase.findMany({
+        where: { OR: [{ Id: { in: caseRefs } }, { CaseId: { in: caseRefs } }] },
+        select: { Id: true, CaseId: true },
+      });
+      for (const c of linked) {
+        caseIdMap.set(c.Id, c.CaseId);
+        caseIdMap.set(c.CaseId, c.CaseId);
+      }
+    }
+
     res.json({
       success: true,
-      tasks: tasks.map(transformTask),
+      tasks: tasks.map((t) => {
+        const mapped = transformTask(t);
+        return {
+          ...mapped,
+          caseId: (t.CaseId && caseIdMap.get(t.CaseId)) || t.CaseId || null,
+        };
+      }),
       meta: {
         total: count,
         page: pageNum,
