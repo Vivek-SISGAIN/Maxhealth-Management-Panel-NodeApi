@@ -1,5 +1,6 @@
 const { Router } = require("express");
 const brm = require("../../services/brmInsights.service");
+const dash = require("../../services/brmDashboard.service");
 
 const router = Router();
 
@@ -117,6 +118,48 @@ router.get("/brm/compare", async (req, res) => {
     return ok(res, data);
   } catch (err) {
     return fail(res, err);
+  }
+});
+
+/* ─── BRM Dashboard (parity with BRM workbasket master_data / my_renewal) ─── */
+
+/** GET /management/brm/dashboard/executives — proxies BRM workbasket */
+router.get("/brm/dashboard/executives", async (req, res) => {
+  try {
+    const data = await dash.getDashboardExecutives(req.headers);
+    return ok(res, data);
+  } catch (err) {
+    return fail(res, err, "Failed to load dashboard executives");
+  }
+});
+
+/** GET /management/brm/dashboard/master_data — proxies BRM workbasket/master_data */
+router.get("/brm/dashboard/master_data", async (req, res) => {
+  try {
+    const data = await dash.getDashboardMasterData(req.query, req.headers);
+    return ok(res, data);
+  } catch (err) {
+    return fail(res, err, "Failed to load dashboard master data");
+  }
+});
+
+/** GET /management/brm/dashboard/my_renewal — proxies BRM workbasket/my_renewal */
+router.get("/brm/dashboard/my_renewal", async (req, res) => {
+  try {
+    const data = await dash.getDashboardRenewals(req.query, req.headers);
+    return ok(res, data);
+  } catch (err) {
+    return fail(res, err, "Failed to load dashboard renewals");
+  }
+});
+
+/** GET /management/brm/dashboard/export_columns — proxies BRM export_columns */
+router.get("/brm/dashboard/export_columns", async (req, res) => {
+  try {
+    const data = await dash.getDashboardExportColumns(req.query.dataset, req.headers);
+    return ok(res, data);
+  } catch (err) {
+    return fail(res, err, "Failed to load export columns");
   }
 });
 
