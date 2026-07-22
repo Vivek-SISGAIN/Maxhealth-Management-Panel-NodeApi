@@ -1,5 +1,6 @@
 const { Router } = require("express");
 const { prisma } = require("../../lib/prisma");
+const { writeManagementAudit } = require("../../services/managementAudit.service");
 const router = Router();
 
 const MEDICAL_STAGES = {
@@ -442,6 +443,14 @@ router.patch("/approvals/:id/approve", async (req, res) => {
 
     await syncMemberDecision(memberId, "APPROVED", decidedBy, req.body.notes || null);
 
+    await writeManagementAudit({
+      eventType: "APPROVAL_APPROVE",
+      caseKey: String(task.CaseId || taskId),
+      changedBy: decidedBy,
+      newValues: { memberId, decision: "APPROVED", notes: req.body.notes || null },
+      module: "approvals",
+    });
+
     const uwCase = task.CaseId
       ? await prisma.underwritingCase.findFirst({
           where: { OR: [{ Id: task.CaseId }, { CaseId: task.CaseId }] },
@@ -518,6 +527,14 @@ router.patch("/approvals/:id/reject", async (req, res) => {
     });
 
     await syncMemberDecision(memberId, "REJECTED", decidedBy, req.body.notes || null);
+
+    await writeManagementAudit({
+      eventType: "APPROVAL_REJECT",
+      caseKey: String(task.CaseId || taskId),
+      changedBy: decidedBy,
+      newValues: { memberId, decision: "REJECTED", notes: req.body.notes || null },
+      module: "approvals",
+    });
 
     const uwCase = task.CaseId
       ? await prisma.underwritingCase.findFirst({

@@ -1,5 +1,6 @@
 const { Router } = require("express");
 const { prisma } = require("../../lib/prisma");
+const { writeManagementAudit } = require("../../services/managementAudit.service");
 const router = Router();
 
 // Transform database fields to frontend format
@@ -92,6 +93,13 @@ router.post("/alerts", async (req, res) => {
     const newAlert = await prisma.managementAlert.create({
       data: { Type: type, Title: title, Message: message, Department: department, Severity: severity || 'medium', Status: 'active', Source: source, Metadata: metadata, ExpiresAt: expiresAt ? new Date(expiresAt) : null }
     });
+    await writeManagementAudit({
+      eventType: "ALERT_CREATE",
+      caseKey: String(newAlert.Id),
+      changedBy: req.headers["x-gateway-user-id"] || null,
+      newValues: { title, severity: severity || "medium", department },
+      module: "alerts",
+    });
     res.status(201).json({ success: true, data: transformAlert(newAlert) });
   } catch (err) {
     console.error(err);
@@ -105,6 +113,13 @@ router.patch("/alerts/:id/acknowledge", async (req, res) => {
       where: { Id: req.params.id },
       data: { Status: 'acknowledged', AcknowledgedAt: new Date(), AcknowledgedBy: req.body.acknowledgedBy }
     });
+    await writeManagementAudit({
+      eventType: "ALERT_ACK",
+      caseKey: String(alert.Id),
+      changedBy: req.body.acknowledgedBy || req.headers["x-gateway-user-id"] || null,
+      newValues: { status: "acknowledged" },
+      module: "alerts",
+    });
     res.json({ success: true, data: transformAlert(alert) });
   } catch (err) {
     console.error(err);
@@ -117,6 +132,13 @@ router.patch("/alerts/:id/resolve", async (req, res) => {
     const alert = await prisma.managementAlert.update({
       where: { Id: req.params.id },
       data: { Status: 'resolved', ResolvedAt: new Date(), ResolvedBy: req.body.resolvedBy }
+    });
+    await writeManagementAudit({
+      eventType: "ALERT_RESOLVE",
+      caseKey: String(alert.Id),
+      changedBy: req.body.resolvedBy || req.headers["x-gateway-user-id"] || null,
+      newValues: { status: "resolved" },
+      module: "alerts",
     });
     res.json({ success: true, data: transformAlert(alert) });
   } catch (err) {

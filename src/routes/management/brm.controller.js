@@ -17,7 +17,7 @@ const q = (req) => ({
   dateFrom: req.query.dateFrom || req.query.from || undefined,
   dateTo: req.query.dateTo || req.query.to || undefined,
   executiveId: req.query.executiveId || undefined,
-  brmName: req.query.brmName || undefined,
+  brmName: req.query.brmName || req.query.brmNames || undefined,
   search: req.query.search || undefined,
   type: req.query.type || "new",
   status: req.query.status || undefined,
