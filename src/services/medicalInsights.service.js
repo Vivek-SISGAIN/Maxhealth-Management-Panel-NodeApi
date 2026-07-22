@@ -2,9 +2,7 @@
  * Management Medical Insights — aggregated UW / workbench / SLA views.
  * Source: shared UnderwritingCase + MedicalTask (doctorWorkbench in Metadata).
  */
-const { PrismaClient } = require("@prisma/client");
-
-const prisma = new PrismaClient();
+const { prisma } = require("../lib/prisma");
 
 const toNumber = (v) => {
   if (v == null) return 0;

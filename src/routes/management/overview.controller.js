@@ -1,9 +1,7 @@
 const { Router } = require("express");
-const { PrismaClient } = require("@prisma/client");
+const { prisma } = require("../../lib/prisma");
 const brm = require("../../services/brmInsights.service");
 const medical = require("../../services/medicalInsights.service");
-
-const prisma = new PrismaClient();
 const router = Router();
 
 const SENT = "SENT_FOR_MANAGEMENT_APPROVAL";

@@ -2,11 +2,9 @@
  * Live management insights — departments / performance / analytics
  * from shared Postgres (BRM + Medical UW + Alerts + optional HRMS tables).
  */
-const { PrismaClient } = require("@prisma/client");
+const { prisma } = require("../lib/prisma");
 const brm = require("./brmInsights.service");
 const medical = require("./medicalInsights.service");
-
-const prisma = new PrismaClient();
 
 const SENT = "SENT_FOR_MANAGEMENT_APPROVAL";
 const RESUB = "RESUBMITTED";

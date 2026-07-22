@@ -3,9 +3,7 @@
  * Persists via raw SQL so it works even if Prisma client isn't regenerated.
  */
 const { randomUUID } = require("crypto");
-const { PrismaClient } = require("@prisma/client");
-
-const prisma = new PrismaClient();
+const { prisma } = require("../lib/prisma");
 let tableReady = false;
 
 async function ensureTable() {

@@ -2,9 +2,7 @@
  * Management BRM Insights â€” executive read aggregations against shared Postgres.
  * BRM list: AspNetRoles.Name IN ('BRM','Admin') â€” not hardcoded RoleId (BRM backend GUID is stale).
  */
-const { PrismaClient } = require("@prisma/client");
-
-const prisma = new PrismaClient();
+const { prisma } = require("../lib/prisma");
 const Redis = require("ioredis");
 
 const redis = process.env.REDIS_URL
