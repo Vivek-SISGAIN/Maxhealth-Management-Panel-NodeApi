@@ -75,6 +75,18 @@ router.get("/brm/summary/list", async (req, res) => {
 router.get("/brm/cases", async (req, res) => {
   try {
     const data = await brm.getCases(q(req));
+    const role = String(
+      req.headers["x-gateway-role"] || req.headers["x-user-role"] || "",
+    ).toLowerCase();
+    const isAdmin = role.includes("admin");
+    if (!isAdmin && Array.isArray(data.cases)) {
+      const { maskPii } = require("../../services/scheduledExport.service");
+      data.cases = data.cases.map((c) => ({
+        ...c,
+        BrokerEmail: c.BrokerEmail ? maskPii(c.BrokerEmail) : c.BrokerEmail,
+      }));
+      data.piiMasked = true;
+    }
     return ok(res, data);
   } catch (err) {
     return fail(res, err);
@@ -115,6 +127,55 @@ router.get("/brm/renewals", async (req, res) => {
 router.get("/brm/compare", async (req, res) => {
   try {
     const data = await brm.getCompare(q(req));
+    return ok(res, data);
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+/** GET /management/brm/lost-reasons — FSD lost-reason mix */
+router.get("/brm/lost-reasons", async (req, res) => {
+  try {
+    const data = await brm.getLostReasonMix(q(req));
+    return ok(res, data);
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+/** GET /management/brm/cases/:caseKey/members — broker→member drilldown */
+router.get("/brm/cases/:caseKey/members", async (req, res) => {
+  try {
+    const data = await brm.getCaseMemberDrilldown(req.params.caseKey);
+    const role = String(
+      req.headers["x-gateway-role"] || req.headers["x-user-role"] || "",
+    ).toLowerCase();
+    const isAdmin = role.includes("admin");
+    if (!isAdmin && data.brokerEmail) {
+      const { maskPii } = require("../../services/scheduledExport.service");
+      data.brokerEmail = maskPii(data.brokerEmail);
+    }
+    if (!isAdmin && Array.isArray(data.members)) {
+      const { maskPii } = require("../../services/scheduledExport.service");
+      data.members = data.members.map((m) => ({
+        ...m,
+        Email: m.Email ? maskPii(m.Email) : m.Email,
+        Mobile: m.Mobile ? maskPii(m.Mobile) : m.Mobile,
+      }));
+    }
+    try {
+      const { insertMgmtAudit } = require("../../services/mgmtAudit.service");
+      await insertMgmtAudit({
+        eventType: "PII_VIEW",
+        entityType: "CASE_MEMBERS",
+        caseKey: data.displayId || req.params.caseKey,
+        changedBy: String(req.headers["x-gateway-user-id"] || "").trim() || null,
+        newValues: { memberCount: data.memberCount, masked: !isAdmin },
+        module: "member-drilldown",
+      });
+    } catch {
+      /* ignore */
+    }
     return ok(res, data);
   } catch (err) {
     return fail(res, err);
