@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Management BRM Insights â€” executive read aggregations against shared Postgres.
  * BRM list: AspNetRoles.Name IN ('BRM','Admin') â€” not hardcoded RoleId (BRM backend GUID is stale).
  */
@@ -40,6 +40,51 @@ const RENEWAL_ONGOING_SQL = `${RENEWAL_STATUS_CODE} IN ('1', '4')`;
 const RENEWAL_CONFIRMED_SQL = `${RENEWAL_STATUS_CODE} = '2'`;
 const RENEWAL_LOST_SQL = `${RENEWAL_STATUS_CODE} = '3'`;
 const RENEWAL_PENDING_SQL = `(${RENEWAL_STATUS_CODE} = '' OR ${RENEWAL_STATUS_CODE} NOT IN ('1', '2', '3', '4'))`;
+
+/**
+ * Shared NB + Renewal status buckets (same labels in Management UI).
+ * Deal priority: Hot=1 · Active=2 · Warm=3 · Cold=4
+ * Lifecycle: Ongoing = Status 1/2/5 (Draft/Negotiation/Emailed) · Won=3 · Lost=4
+ * Linked renewals use quotation case Status/DealStatus; unlinked use BrmActionStatus.
+ */
+const NB_ONGOING_STATUS_SQL = `"Status" IN (1, 2, 5)`;
+const NB_WON_STATUS_SQL = `"Status" = 3`;
+const NB_LOST_STATUS_SQL = `"Status" = 4`;
+const NB_HOT_SQL = `"DealStatus" = 1`;
+const NB_ACTIVE_SQL = `"DealStatus" = 2`;
+const NB_WARM_SQL = `"DealStatus" = 3`;
+const NB_COLD_SQL = `"DealStatus" = 4`;
+
+const RENEWAL_LINKED_JOIN = `
+  LEFT JOIN public."HealthInsuranceQuotationCase" lqc
+    ON lqc."ID" = b."LinkedQuotationCaseId"
+   AND COALESCE(lqc."IsDeleted", false) = false`;
+
+const RENEWAL_EFF_HOT_SQL = `(b."LinkedQuotationCaseId" IS NOT NULL AND lqc."DealStatus" = 1)`;
+const RENEWAL_EFF_ACTIVE_SQL = `(b."LinkedQuotationCaseId" IS NOT NULL AND lqc."DealStatus" = 2)`;
+const RENEWAL_EFF_WARM_SQL = `(b."LinkedQuotationCaseId" IS NOT NULL AND lqc."DealStatus" = 3)`;
+const RENEWAL_EFF_COLD_SQL = `(b."LinkedQuotationCaseId" IS NOT NULL AND lqc."DealStatus" = 4)`;
+const RENEWAL_EFF_ONGOING_SQL = `(
+  (b."LinkedQuotationCaseId" IS NOT NULL AND lqc."Status" IN (1, 2, 5))
+  OR (b."LinkedQuotationCaseId" IS NULL AND ${RENEWAL_STATUS_CODE} IN ('1', '4', '5', '6'))
+)`;
+const RENEWAL_EFF_WON_SQL = `(
+  (b."LinkedQuotationCaseId" IS NOT NULL AND lqc."Status" = 3)
+  OR (b."LinkedQuotationCaseId" IS NULL AND ${RENEWAL_CONFIRMED_SQL})
+)`;
+const RENEWAL_EFF_LOST_SQL = `(
+  (b."LinkedQuotationCaseId" IS NOT NULL AND lqc."Status" = 4)
+  OR (b."LinkedQuotationCaseId" IS NULL AND ${RENEWAL_LOST_SQL})
+)`;
+const RENEWAL_WON_PREMIUM_SQL = `COALESCE(SUM(
+  CASE
+    WHEN b."LinkedQuotationCaseId" IS NOT NULL AND lqc."Status" = 3
+      THEN COALESCE(lqc."TargetPremium"::float, 0)
+    WHEN b."LinkedQuotationCaseId" IS NULL AND ${RENEWAL_CONFIRMED_SQL}
+      THEN COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)
+    ELSE 0
+  END
+), 0)::float`;
 
 /** Latest member row per Name+DOB (handles duplicated census on a case version).
  * Gross = BaseAmount (formula-adjusted); falls back to PlanAmount / TotalAmount.
@@ -1162,10 +1207,13 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
       SELECT
         executive_id,
         COUNT(*)::int AS "newCaseTotal",
-        COUNT(*) FILTER (WHERE "DealStatus" = 1)::int AS "hotCases",
-        COUNT(*) FILTER (WHERE "DealStatus" = 2)::int AS "activeCases",
-        COUNT(*) FILTER (WHERE "Status" = 3)::int AS "wonCases",
-        COUNT(*) FILTER (WHERE "Status" = 4)::int AS "lostCases",
+        COUNT(*) FILTER (WHERE ${NB_HOT_SQL})::int AS "hotCases",
+        COUNT(*) FILTER (WHERE ${NB_ACTIVE_SQL})::int AS "activeCases",
+        COUNT(*) FILTER (WHERE ${NB_WARM_SQL})::int AS "warmCases",
+        COUNT(*) FILTER (WHERE ${NB_COLD_SQL})::int AS "coldCases",
+        COUNT(*) FILTER (WHERE ${NB_ONGOING_STATUS_SQL})::int AS "ongoingCases",
+        COUNT(*) FILTER (WHERE ${NB_WON_STATUS_SQL})::int AS "wonCases",
+        COUNT(*) FILTER (WHERE ${NB_LOST_STATUS_SQL})::int AS "lostCases",
         COALESCE(SUM(target_premium), 0)::float AS "openPremium"
       FROM open_latest
       GROUP BY executive_id
@@ -1182,13 +1230,19 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
       SELECT
         bu."Id" AS executive_id,
         COUNT(*)::int AS "renewalCaseTotal",
-        COUNT(*) FILTER (WHERE ${RENEWAL_ONGOING_SQL})::int AS "renewalOngoing",
-        COUNT(*) FILTER (WHERE ${RENEWAL_CONFIRMED_SQL})::int AS "renewalConfirmed",
-        COUNT(*) FILTER (WHERE ${RENEWAL_LOST_SQL})::int AS "renewalLost",
-        COUNT(*) FILTER (WHERE ${RENEWAL_PENDING_SQL})::int AS "renewalPending",
-        COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "renewalPremium"
+        COUNT(*) FILTER (WHERE ${RENEWAL_EFF_HOT_SQL})::int AS "renewalHot",
+        COUNT(*) FILTER (WHERE ${RENEWAL_EFF_ACTIVE_SQL})::int AS "renewalActive",
+        COUNT(*) FILTER (WHERE ${RENEWAL_EFF_WARM_SQL})::int AS "renewalWarm",
+        COUNT(*) FILTER (WHERE ${RENEWAL_EFF_COLD_SQL})::int AS "renewalCold",
+        COUNT(*) FILTER (WHERE ${RENEWAL_EFF_ONGOING_SQL})::int AS "renewalOngoing",
+        COUNT(*) FILTER (WHERE ${RENEWAL_EFF_WON_SQL})::int AS "renewalConfirmed",
+        COUNT(*) FILTER (WHERE ${RENEWAL_EFF_LOST_SQL})::int AS "renewalLost",
+        COUNT(*) FILTER (WHERE ${RENEWAL_PENDING_SQL} AND b."LinkedQuotationCaseId" IS NULL)::int AS "renewalPending",
+        COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "renewalPremium",
+        ${RENEWAL_WON_PREMIUM_SQL} AS "renewalWonPremium"
       FROM brm_users bu
       JOIN public."BrmRenewalData" b ON bu."Id" = ANY(b."BrmUserIds")
+      ${RENEWAL_LINKED_JOIN}
       WHERE ${renewalBatchScopeSql(false)}
         AND ${RENEWAL_GROUP_ONLY_SQL}
       GROUP BY bu."Id"
@@ -1199,6 +1253,10 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
       bu.role,
       COALESCE(o."newCaseTotal", 0)::int AS "newCaseTotal",
       COALESCE(r."renewalCaseTotal", 0)::int AS "renewalCaseTotal",
+      COALESCE(r."renewalHot", 0)::int AS "renewalHot",
+      COALESCE(r."renewalActive", 0)::int AS "renewalActive",
+      COALESCE(r."renewalWarm", 0)::int AS "renewalWarm",
+      COALESCE(r."renewalCold", 0)::int AS "renewalCold",
       COALESCE(r."renewalOngoing", 0)::int AS "renewalOngoing",
       COALESCE(r."renewalConfirmed", 0)::int AS "renewalConfirmed",
       COALESCE(r."renewalLost", 0)::int AS "renewalLost",
@@ -1210,11 +1268,18 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
       COALESCE(o."newCaseTotal", 0)::int AS "openCases",
       COALESCE(o."activeCases", 0)::int AS "activeCases",
       COALESCE(o."hotCases", 0)::int AS "hotCases",
+      COALESCE(o."warmCases", 0)::int AS "warmCases",
+      COALESCE(o."coldCases", 0)::int AS "coldCases",
+      COALESCE(o."ongoingCases", 0)::int AS "ongoingCases",
       COALESCE(o."wonCases", 0)::int AS "wonCases",
       COALESCE(o."lostCases", 0)::int AS "lostCases",
       COALESCE(o."openPremium", 0)::float AS "totalGrossPremium",
+      COALESCE(o."openPremium", 0)::float AS "newBusinessPremium",
       COALESCE(bk."bookedPremium", 0)::float AS "bookedPremium",
       COALESCE(r."renewalPremium", 0)::float AS "renewalPremium",
+      COALESCE(r."renewalWonPremium", 0)::float AS "renewalWonPremium",
+      (COALESCE(bk."bookedPremium", 0) + COALESCE(r."renewalWonPremium", 0))::float AS "winCasePremium",
+      (COALESCE(o."openPremium", 0) + COALESCE(r."renewalPremium", 0) + COALESCE(bk."bookedPremium", 0))::float AS "totalPremium",
       CASE
         WHEN COALESCE(o."newCaseTotal", 0) > 0
         THEN (COALESCE(o."openPremium", 0) / o."newCaseTotal")::float
@@ -1237,8 +1302,12 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
       acc.bookedCaseTotal += toNumber(r.bookedCaseTotal);
       acc.brmTotal += toNumber(r.brmTotal);
       acc.totalGrossPremium += toNumber(r.totalGrossPremium);
+      acc.newBusinessPremium += toNumber(r.newBusinessPremium);
       acc.bookedPremium += toNumber(r.bookedPremium);
       acc.renewalPremium += toNumber(r.renewalPremium);
+      acc.renewalWonPremium += toNumber(r.renewalWonPremium);
+      acc.winCasePremium += toNumber(r.winCasePremium);
+      acc.totalPremium += toNumber(r.totalPremium);
       return acc;
     },
     {
@@ -1248,8 +1317,12 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
       bookedCaseTotal: 0,
       brmTotal: 0,
       totalGrossPremium: 0,
+      newBusinessPremium: 0,
       bookedPremium: 0,
       renewalPremium: 0,
+      renewalWonPremium: 0,
+      winCasePremium: 0,
+      totalPremium: 0,
     },
   );
 
@@ -1619,10 +1692,13 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
       SELECT
         COUNT(*)::int AS "openCount",
         0::int AS "bookedCount",
-        COUNT(*) FILTER (WHERE "DealStatus" = 1)::int AS "hotCount",
-        COUNT(*) FILTER (WHERE "DealStatus" = 2)::int AS "activeCount",
-        COUNT(*) FILTER (WHERE "Status" = 3)::int AS "wonCount",
-        COUNT(*) FILTER (WHERE "Status" = 4)::int AS "lostCount",
+        COUNT(*) FILTER (WHERE ${NB_HOT_SQL})::int AS "hotCount",
+        COUNT(*) FILTER (WHERE ${NB_ACTIVE_SQL})::int AS "activeCount",
+        COUNT(*) FILTER (WHERE ${NB_WARM_SQL})::int AS "warmCount",
+        COUNT(*) FILTER (WHERE ${NB_COLD_SQL})::int AS "coldCount",
+        COUNT(*) FILTER (WHERE ${NB_ONGOING_STATUS_SQL})::int AS "ongoingCount",
+        COUNT(*) FILTER (WHERE ${NB_WON_STATUS_SQL})::int AS "wonCount",
+        COUNT(*) FILTER (WHERE ${NB_LOST_STATUS_SQL})::int AS "lostCount",
         COUNT(*)::int AS "totalCount",
         COALESCE(SUM(COALESCE("TargetPremium", 0)), 0)::float AS "totalGrossPremium",
         0::float AS "bookedPremium",
@@ -1669,10 +1745,13 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
       SELECT
         COUNT(*)::int AS "openCount",
         0::int AS "bookedCount",
-        COUNT(*) FILTER (WHERE "DealStatus" = 1)::int AS "hotCount",
-        COUNT(*) FILTER (WHERE "DealStatus" = 2)::int AS "activeCount",
-        COUNT(*) FILTER (WHERE "Status" = 3)::int AS "wonCount",
-        COUNT(*) FILTER (WHERE "Status" = 4)::int AS "lostCount",
+        COUNT(*) FILTER (WHERE ${NB_HOT_SQL})::int AS "hotCount",
+        COUNT(*) FILTER (WHERE ${NB_ACTIVE_SQL})::int AS "activeCount",
+        COUNT(*) FILTER (WHERE ${NB_WARM_SQL})::int AS "warmCount",
+        COUNT(*) FILTER (WHERE ${NB_COLD_SQL})::int AS "coldCount",
+        COUNT(*) FILTER (WHERE ${NB_ONGOING_STATUS_SQL})::int AS "ongoingCount",
+        COUNT(*) FILTER (WHERE ${NB_WON_STATUS_SQL})::int AS "wonCount",
+        COUNT(*) FILTER (WHERE ${NB_LOST_STATUS_SQL})::int AS "lostCount",
         COUNT(*)::int AS "totalCount",
         COALESCE(SUM(COALESCE("TargetPremium", 0)), 0)::float AS "totalGrossPremium",
         0::float AS "bookedPremium",
@@ -1707,12 +1786,18 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
     query(pipelineSql, pipelineParams),
     query(
       `SELECT COUNT(*)::int AS total,
-              COUNT(*) FILTER (WHERE ${RENEWAL_ONGOING_SQL})::int AS ongoing,
-              COUNT(*) FILTER (WHERE ${RENEWAL_CONFIRMED_SQL})::int AS confirmed,
-              COUNT(*) FILTER (WHERE ${RENEWAL_LOST_SQL})::int AS lost,
-              COUNT(*) FILTER (WHERE ${RENEWAL_PENDING_SQL})::int AS pending,
-              COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "totalExpiringPremium"
+              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_HOT_SQL})::int AS hot,
+              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_ACTIVE_SQL})::int AS active,
+              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_WARM_SQL})::int AS warm,
+              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_COLD_SQL})::int AS cold,
+              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_ONGOING_SQL})::int AS ongoing,
+              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_WON_SQL})::int AS confirmed,
+              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_LOST_SQL})::int AS lost,
+              COUNT(*) FILTER (WHERE ${RENEWAL_PENDING_SQL} AND b."LinkedQuotationCaseId" IS NULL)::int AS pending,
+              COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "totalExpiringPremium",
+              ${RENEWAL_WON_PREMIUM_SQL} AS "wonPremium"
        FROM public."BrmRenewalData" b
+       ${RENEWAL_LINKED_JOIN}
        ${renewalWhere}`,
       renewalParams,
     ),
@@ -1742,6 +1827,9 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
     open: toNumber(p.openCount),
     hot: toNumber(p.hotCount),
     active: toNumber(p.activeCount),
+    warm: toNumber(p.warmCount),
+    cold: toNumber(p.coldCount),
+    ongoing: toNumber(p.ongoingCount),
     won: toNumber(p.wonCount),
     lost: toNumber(p.lostCount),
     other: Math.max(
@@ -1749,6 +1837,8 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
       toNumber(p.totalCount) -
         toNumber(p.hotCount) -
         toNumber(p.activeCount) -
+        toNumber(p.warmCount) -
+        toNumber(p.coldCount) -
         toNumber(p.wonCount) -
         toNumber(p.lostCount),
     ),
@@ -1758,33 +1848,51 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
 
   const renewalHealth = {
     total: toNumber(renewalSnap.total),
+    hot: toNumber(renewalSnap.hot),
+    active: toNumber(renewalSnap.active),
+    warm: toNumber(renewalSnap.warm),
+    cold: toNumber(renewalSnap.cold),
     ongoing: toNumber(renewalSnap.ongoing),
     confirmed: toNumber(renewalSnap.confirmed),
+    won: toNumber(renewalSnap.confirmed),
     lost: toNumber(renewalSnap.lost),
     pending: toNumber(renewalSnap.pending),
     expiringPremium: toNumber(renewalSnap.totalExpiringPremium),
+    wonPremium: toNumber(renewalSnap.wonPremium),
   };
+
+  const winCasePremium = bookedPremium + renewalHealth.wonPremium;
 
   const cards = {
     achievedTotal: bookedPremium,
     AchievedBookedConfirmedNewPremium: bookedPremium,
     AchievedBookedConfirmedRenewalPremium: renewalHealth.expiringPremium,
-    totalPremium: toNumber(p.totalGrossPremium),
+    totalPremium: toNumber(p.totalGrossPremium) + renewalHealth.expiringPremium + bookedPremium,
     openPremium: toNumber(p.openPremium),
     bookedPremium,
     bookedCount,
+    winCasePremium,
     forecastTotal: bookedPremium + toNumber(p.openPremium) * 0.6,
     nbCount: toNumber(p.totalCount),
     nbHot: toNumber(p.hotCount),
     nbActive: toNumber(p.activeCount),
+    nbWarm: toNumber(p.warmCount),
+    nbCold: toNumber(p.coldCount),
+    nbOngoing: toNumber(p.ongoingCount),
     nbWon: toNumber(p.wonCount),
     nbLost: toNumber(p.lostCount),
     renCount: renewalHealth.total,
+    renHot: renewalHealth.hot,
+    renActive: renewalHealth.active,
+    renWarm: renewalHealth.warm,
+    renCold: renewalHealth.cold,
     renOngoing: renewalHealth.ongoing,
     renConfirmed: renewalHealth.confirmed,
+    renWon: renewalHealth.won,
     renLost: renewalHealth.lost,
     renPending: renewalHealth.pending,
     renExpiringPremium: renewalHealth.expiringPremium,
+    renWonPremium: renewalHealth.wonPremium,
     endCount: 0,
     openPipelineCount: toNumber(p.openCount),
     brmCount: byExecutive.executives.length,
@@ -1796,18 +1904,18 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
   insights.push({
     type: "pipeline",
     title: "New business pipeline",
-    detail: `${pipelineHealth.total} open cases · Hot ${pipelineHealth.hot} · Active ${pipelineHealth.active} · Won ${pipelineHealth.won} · Lost ${pipelineHealth.lost}`,
+    detail: `${pipelineHealth.total} open · Hot ${pipelineHealth.hot} · Active ${pipelineHealth.active} · Cold ${pipelineHealth.cold} · Ongoing ${pipelineHealth.ongoing} · Won ${pipelineHealth.won} · Lost ${pipelineHealth.lost}`,
   });
   insights.push({
     type: "renewal",
     title: "Renewal portfolio",
-    detail: `${renewalHealth.total} groups · Ongoing ${renewalHealth.ongoing} · Confirmed ${renewalHealth.confirmed} · Lost ${renewalHealth.lost} · Pending ${renewalHealth.pending}`,
+    detail: `${renewalHealth.total} groups · Hot ${renewalHealth.hot} · Active ${renewalHealth.active} · Cold ${renewalHealth.cold} · Ongoing ${renewalHealth.ongoing} · Won ${renewalHealth.won} · Lost ${renewalHealth.lost}`,
   });
   if (topBrms[0]) {
     insights.push({
       type: "load",
       title: "Highest case load",
-      detail: `${topBrms[0].executiveName} · ${formatInt(topBrms[0].brmTotal)} total (NB ${formatInt(topBrms[0].newCaseTotal)} · RN ${formatInt(topBrms[0].renewalCaseTotal)} · Booked ${formatInt(topBrms[0].bookedCaseTotal)})`,
+      detail: `${topBrms[0].executiveName} · ${formatInt(topBrms[0].brmTotal)} total (NB ${formatInt(topBrms[0].newCaseTotal)} · RN ${formatInt(topBrms[0].renewalCaseTotal)})`,
     });
   }
   const lowWin = [...byExecutive.executives]
@@ -1829,12 +1937,19 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
     byExecutiveFull: byExecutive.executives,
     byExecutiveTotals: {
       ...execTotals,
+      renewalHot: byExecutive.executives.reduce((s, e) => s + toNumber(e.renewalHot), 0),
+      renewalActive: byExecutive.executives.reduce((s, e) => s + toNumber(e.renewalActive), 0),
+      renewalWarm: byExecutive.executives.reduce((s, e) => s + toNumber(e.renewalWarm), 0),
+      renewalCold: byExecutive.executives.reduce((s, e) => s + toNumber(e.renewalCold), 0),
       renewalOngoing: byExecutive.executives.reduce((s, e) => s + toNumber(e.renewalOngoing), 0),
       renewalConfirmed: byExecutive.executives.reduce((s, e) => s + toNumber(e.renewalConfirmed), 0),
       renewalLost: byExecutive.executives.reduce((s, e) => s + toNumber(e.renewalLost), 0),
       renewalPending: byExecutive.executives.reduce((s, e) => s + toNumber(e.renewalPending), 0),
       hotCases: byExecutive.executives.reduce((s, e) => s + toNumber(e.hotCases), 0),
       activeCases: byExecutive.executives.reduce((s, e) => s + toNumber(e.activeCases), 0),
+      warmCases: byExecutive.executives.reduce((s, e) => s + toNumber(e.warmCases), 0),
+      coldCases: byExecutive.executives.reduce((s, e) => s + toNumber(e.coldCases), 0),
+      ongoingCases: byExecutive.executives.reduce((s, e) => s + toNumber(e.ongoingCases), 0),
       wonCases: byExecutive.executives.reduce((s, e) => s + toNumber(e.wonCases), 0),
       lostCases: byExecutive.executives.reduce((s, e) => s + toNumber(e.lostCases), 0),
     },
