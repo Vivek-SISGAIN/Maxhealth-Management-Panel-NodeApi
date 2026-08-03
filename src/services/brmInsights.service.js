@@ -404,7 +404,11 @@ async function getExecutives({ includeAdmin = true } = {}) {
 }
 
 async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
-  const dates = withDefaultDates({ dateFrom, dateTo });
+  // Empty dates = all-time (do not force current month)
+  const dates = {
+    dateFrom: dateFrom && String(dateFrom).trim() ? String(dateFrom).trim() : null,
+    dateTo: dateTo && String(dateTo).trim() ? String(dateTo).trim() : null,
+  };
   const params = [];
   const conditions = buildMasterDateConditions(dates.dateFrom, dates.dateTo, params);
   const brmNames = pushBrmNameCondition(conditions, params, brmName);
@@ -412,8 +416,8 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
   const cacheKey =
-    `mgmt:brm:summaryCards:${brmNames.length ? brmNames.join("|").toLowerCase() : "all"}:` +
-    `${dates.dateFrom}:${dates.dateTo}`;
+    `mgmt:brm:summaryCards:v2-status3-cps:${brmNames.length ? brmNames.join("|").toLowerCase() : "all"}:` +
+    `${dates.dateFrom || ""}:${dates.dateTo || ""}`;
   if (redis) {
     try {
       const cached = await redis.get(cacheKey);
@@ -427,6 +431,21 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
   const pipelineParams = [];
   let nbAssignFilter = "";
   let rnAssignFilter = "";
+  let nbDateSql = "";
+  let rnDateSql = "";
+  if (dates.dateFrom) {
+    pipelineParams.push(dates.dateFrom);
+    const i = pipelineParams.length;
+    nbDateSql += ` AND qc."PolicyEffectiveDate"::date >= $${i}::date`;
+    rnDateSql += ` AND brd."EffectiveDate"::date >= $${i}::date`;
+  }
+  if (dates.dateTo) {
+    pipelineParams.push(dates.dateTo);
+    const i = pipelineParams.length;
+    nbDateSql += ` AND qc."PolicyEffectiveDate"::date <= $${i}::date`;
+    rnDateSql += ` AND brd."EffectiveDate"::date <= $${i}::date`;
+  }
+
   if (brmIds.length) {
     pipelineParams.push(brmIds);
     const p = pipelineParams.length;
@@ -442,9 +461,7 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
     rnAssignFilter = " AND FALSE";
   }
 
-  // Booked = MasterDataLayer (date-filtered). Confirmed pipeline matches BRM All Summary:
-  // NB = HealthInsuranceQuotationCase DealStatus=2 not booked (latest version);
-  // RN = BrmRenewalData Distributed + BrmActionStatus=2 (no date filter on open pipeline).
+  // Booked = MasterDataLayer (date-filtered). Confirmed = Status=3 / Won, not Ops-booked, CPS Net.
   const [bookedRows, pipelineRows] = await Promise.all([
     query(
       `
@@ -510,38 +527,76 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
             SELECT DISTINCT ON (REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''))
               qc."ID"
             FROM public."HealthInsuranceQuotationCase" qc
-            WHERE qc."BookingStatus" IS false
-              AND qc."DisplayID" ~ '-[BI][0-9]+'
-              AND qc."DealStatus" = 2
+            LEFT JOIN public."CasePremiumSummary" cps ON cps."CaseID" = qc."ID"
+            WHERE COALESCE(qc."IsDeleted", false) = false
+              AND COALESCE(qc."IsArchived", false) = false
+              AND COALESCE(qc."BookingStatus", false) = false
+              AND qc."Status" = 3
+              AND qc."DisplayID" ~ '-[BD][0-9]+'
+              ${nbDateSql}
               ${nbAssignFilter}
-            ORDER BY REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''), qc."ID" DESC
+            ORDER BY
+              REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''),
+              COALESCE(cps."NetPremium", 0) DESC,
+              qc."ID" DESC
           ) t
         ) AS "confirmedNewCount",
         (
+          SELECT COALESCE(SUM(t.net_premium), 0)::float
+          FROM (
+            SELECT DISTINCT ON (REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''))
+              COALESCE(cps."NetPremium", 0)::float AS net_premium
+            FROM public."HealthInsuranceQuotationCase" qc
+            LEFT JOIN public."CasePremiumSummary" cps ON cps."CaseID" = qc."ID"
+            WHERE COALESCE(qc."IsDeleted", false) = false
+              AND COALESCE(qc."IsArchived", false) = false
+              AND COALESCE(qc."BookingStatus", false) = false
+              AND qc."Status" = 3
+              AND qc."DisplayID" ~ '-[BD][0-9]+'
+              ${nbDateSql}
+              ${nbAssignFilter}
+            ORDER BY
+              REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''),
+              COALESCE(cps."NetPremium", 0) DESC,
+              qc."ID" DESC
+          ) t
+        ) AS "confirmedNewPremium",
+        (
           SELECT COUNT(*)::int
           FROM public."BrmRenewalData" brd
+          LEFT JOIN public."HealthInsuranceQuotationCase" lqc
+            ON lqc."ID" = brd."LinkedQuotationCaseId"
+           AND COALESCE(lqc."IsDeleted", false) = false
           WHERE brd."BatchStatus" = 'Distributed'
-            AND brd."BrmActionStatus" = 2
+            AND (
+              (
+                brd."LinkedQuotationCaseId" IS NOT NULL
+                AND lqc."Status" = 3
+                AND COALESCE(lqc."BookingStatus", false) = false
+              )
+              OR (
+                brd."LinkedQuotationCaseId" IS NULL
+                AND brd."BrmActionStatus" = 2
+              )
+            )
+            ${rnDateSql}
             ${rnAssignFilter}
         ) AS "confirmedRenewalCount",
         (
-          SELECT COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float
-          FROM (
-            SELECT DISTINCT ON (REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''))
-              qc."ID", qc."TargetPremium"
-            FROM public."HealthInsuranceQuotationCase" qc
-            WHERE qc."BookingStatus" IS false
-              AND qc."DisplayID" ~ '-[BI][0-9]+'
-              AND qc."DealStatus" = 2
-              ${nbAssignFilter}
-            ORDER BY REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''), qc."ID" DESC
-          ) qc
-        ) AS "confirmedNewPremium",
-        (
           SELECT COALESCE(SUM(
-            COALESCE(NULLIF(brd."ExpiringPremium"::float, 0), mp.total_premium, 0)
+            COALESCE(
+              NULLIF(cps."NetPremium"::float, 0),
+              NULLIF(brd."ExpiringPremium"::float, 0),
+              mp.total_premium,
+              0
+            )
           ), 0)::float
           FROM public."BrmRenewalData" brd
+          LEFT JOIN public."HealthInsuranceQuotationCase" lqc
+            ON lqc."ID" = brd."LinkedQuotationCaseId"
+           AND COALESCE(lqc."IsDeleted", false) = false
+          LEFT JOIN public."CasePremiumSummary" cps
+            ON cps."CaseID" = lqc."ID"
           LEFT JOIN LATERAL (
             SELECT COALESCE(SUM(m."GrossPremium"), 0)::float AS total_premium
             FROM public."MasterDataLayer" m
@@ -555,35 +610,20 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
               )
           ) mp ON TRUE
           WHERE brd."BatchStatus" = 'Distributed'
-            AND brd."BrmActionStatus" = 2
+            AND (
+              (
+                brd."LinkedQuotationCaseId" IS NOT NULL
+                AND lqc."Status" = 3
+                AND COALESCE(lqc."BookingStatus", false) = false
+              )
+              OR (
+                brd."LinkedQuotationCaseId" IS NULL
+                AND brd."BrmActionStatus" = 2
+              )
+            )
+            ${rnDateSql}
             ${rnAssignFilter}
-        ) AS "confirmedRenewalPremium",
-        (
-          SELECT COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float
-          FROM (
-            SELECT DISTINCT ON (REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''))
-              qc."ID", qc."TargetPremium", qc."RenewalFromCaseID"
-            FROM public."HealthInsuranceQuotationCase" qc
-            WHERE qc."BookingStatus" IS true
-              AND qc."DisplayID" ~ '-[BI][0-9]+'
-              ${nbAssignFilter}
-            ORDER BY REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''), qc."ID" DESC
-          ) qc
-          WHERE qc."RenewalFromCaseID" IS NULL OR qc."RenewalFromCaseID" = 0
-        ) AS "AchievedBookedConfirmedNewPremium",
-        (
-          SELECT COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float
-          FROM (
-            SELECT DISTINCT ON (REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''))
-              qc."ID", qc."TargetPremium", qc."RenewalFromCaseID"
-            FROM public."HealthInsuranceQuotationCase" qc
-            WHERE qc."BookingStatus" IS true
-              AND qc."DisplayID" ~ '-[BI][0-9]+'
-              ${nbAssignFilter}
-            ORDER BY REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''), qc."ID" DESC
-          ) qc
-          WHERE qc."RenewalFromCaseID" IS NOT NULL AND qc."RenewalFromCaseID" > 0
-        ) AS "AchievedBookedConfirmedRenewalPremium"
+        ) AS "confirmedRenewalPremium"
       `,
       pipelineParams,
     ),
@@ -594,15 +634,18 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
 
   const confirmedNew = toNumber(p.confirmedNewPremium);
   const confirmedRen = toNumber(p.confirmedRenewalPremium);
-  // Same as BRM: Achieved quotation booked TargetPremium + open confirmed pipeline
-  const achievedNewTotal =
-    toNumber(p.AchievedBookedConfirmedNewPremium) + confirmedNew;
-  const achievedRenTotal =
-    toNumber(p.AchievedBookedConfirmedRenewalPremium) + confirmedRen;
-  const endPremium =
-    toNumber(booked.endGroupPremium) + toNumber(booked.endIndividualPremium);
-  const achievedTotal = achievedNewTotal + achievedRenTotal + endPremium;
-  const forecastTotal = achievedTotal + 0.6 * (confirmedNew + confirmedRen);
+  const nbBooked =
+    toNumber(booked.nbGroupPremium) + toNumber(booked.nbIndividualPremium);
+  const renBooked =
+    toNumber(booked.renGroupPremium) + toNumber(booked.renIndividualPremium);
+  const totalPremium = toNumber(booked.totalPremium);
+  const confirmedTotal = confirmedNew + confirmedRen;
+  // Achieved = MDL booked (NB+RN+End) + confirmed pipeline
+  const achievedTotal = totalPremium + confirmedTotal;
+  const forecastTotal = achievedTotal + 0.6 * confirmedTotal;
+  // Legacy breakdown fields: MDL booked segment + confirmed (endorsements via achievedTotal)
+  const achievedNewTotal = nbBooked + confirmedNew;
+  const achievedRenTotal = renBooked + confirmedRen;
 
   const out = {
     ...booked,
