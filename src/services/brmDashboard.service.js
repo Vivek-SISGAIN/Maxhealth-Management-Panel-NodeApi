@@ -89,9 +89,26 @@ async function getDashboardExportColumns(dataset, headers) {
   });
 }
 
+async function getDashboardAnalytics(query, headers) {
+  return proxyBrmWorkbasket("analytics/reporting", {
+    query: {
+      scope: query.scope || "all",
+      brmUserIds: query.brmUserIds,
+      includeUnassigned: query.includeUnassigned,
+      bookingFilter: query.bookingFilter || query.booking_status || "all",
+      months: query.months,
+      dateFrom: query.dateFrom || query.date_from,
+      dateTo: query.dateTo || query.date_to,
+      topN: query.topN || query.top_n,
+    },
+    headers,
+  });
+}
+
 module.exports = {
   getDashboardExecutives,
   getDashboardMasterData,
   getDashboardRenewals,
   getDashboardExportColumns,
+  getDashboardAnalytics,
 };

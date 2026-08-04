@@ -43,17 +43,17 @@ const RENEWAL_PENDING_SQL = `(${RENEWAL_STATUS_CODE} = '' OR ${RENEWAL_STATUS_CO
 
 /**
  * Shared NB + Renewal status buckets (same labels in Management UI).
- * Deal priority: Hot=1 · Active=2 · Warm=3 · Cold=4
+ * Deal priority: High=1 · Medium=2 · Low=3  (legacy Cold=4 still counted as Low)
  * Lifecycle: Ongoing = Status 1/2/5 (Draft/Negotiation/Emailed) · Won=3 · Lost=4
  * Linked renewals use quotation case Status/DealStatus; unlinked use BrmActionStatus.
  */
 const NB_ONGOING_STATUS_SQL = `"Status" IN (1, 2, 5)`;
 const NB_WON_STATUS_SQL = `"Status" = 3`;
 const NB_LOST_STATUS_SQL = `"Status" = 4`;
-const NB_HOT_SQL = `"DealStatus" = 1`;
-const NB_ACTIVE_SQL = `"DealStatus" = 2`;
-const NB_WARM_SQL = `"DealStatus" = 3`;
-const NB_COLD_SQL = `"DealStatus" = 4`;
+const NB_HOT_SQL = `"DealStatus" = 1`; // High
+const NB_ACTIVE_SQL = `"DealStatus" = 2`; // Medium
+const NB_WARM_SQL = `"DealStatus" = -1`; // retired (Warm merged into Medium)
+const NB_COLD_SQL = `"DealStatus" IN (3, 4)`; // Low (+ legacy Cold)
 
 const RENEWAL_LINKED_JOIN = `
   LEFT JOIN public."HealthInsuranceQuotationCase" lqc
@@ -62,8 +62,8 @@ const RENEWAL_LINKED_JOIN = `
 
 const RENEWAL_EFF_HOT_SQL = `(b."LinkedQuotationCaseId" IS NOT NULL AND lqc."DealStatus" = 1)`;
 const RENEWAL_EFF_ACTIVE_SQL = `(b."LinkedQuotationCaseId" IS NOT NULL AND lqc."DealStatus" = 2)`;
-const RENEWAL_EFF_WARM_SQL = `(b."LinkedQuotationCaseId" IS NOT NULL AND lqc."DealStatus" = 3)`;
-const RENEWAL_EFF_COLD_SQL = `(b."LinkedQuotationCaseId" IS NOT NULL AND lqc."DealStatus" = 4)`;
+const RENEWAL_EFF_WARM_SQL = `(FALSE)`;
+const RENEWAL_EFF_COLD_SQL = `(b."LinkedQuotationCaseId" IS NOT NULL AND lqc."DealStatus" IN (3, 4))`;
 const RENEWAL_EFF_ONGOING_SQL = `(
   (b."LinkedQuotationCaseId" IS NOT NULL AND lqc."Status" IN (1, 2, 5))
   OR (b."LinkedQuotationCaseId" IS NULL AND ${RENEWAL_STATUS_CODE} IN ('1', '4', '5', '6'))

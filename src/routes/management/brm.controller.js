@@ -224,4 +224,14 @@ router.get("/brm/dashboard/export_columns", async (req, res) => {
   }
 });
 
+/** GET /management/brm/dashboard/analytics — proxies BRM analytics/reporting */
+router.get("/brm/dashboard/analytics", async (req, res) => {
+  try {
+    const data = await dash.getDashboardAnalytics(req.query, req.headers);
+    return ok(res, data);
+  } catch (err) {
+    return fail(res, err, "Failed to load portfolio analytics");
+  }
+});
+
 module.exports = router;
