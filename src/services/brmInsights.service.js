@@ -1537,22 +1537,34 @@ async function getRenewals({
   const offsetIdx = params.length;
 
   // Same as BRM BrokerCaseDetailsService.renewalMasterDataLateralJoin:
-  // EndorsementTypeCode = '02' + PolicyList â†’ TechnicalSheetNumber match.
   // Displayed Expiring Premium = stored column, fallback MasterData SUM(GrossPremium).
+  // Expiry = live MAX(MasterDataLayer.PolicyExpiryDate) by group — same as Renewal panel End.
   const renewalMasterDataLateralJoin = `
     LEFT JOIN LATERAL (
       SELECT
         COUNT(*)::int AS member_count,
-        COALESCE(SUM(m."GrossPremium"), 0)::float AS total_premium
+        COALESCE(SUM(m."GrossPremium"), 0)::float AS total_premium,
+        MAX(m."PolicyExpiryDate") FILTER (
+          WHERE m."PolicyExpiryDate" IS NOT NULL
+            AND m."PolicyExpiryDate" != 'infinity'::date
+        ) AS expiry_date
       FROM public."MasterDataLayer" m
-      WHERE m."EndorsementTypeCode" = '02'
-        AND m."TechnicalSheetNumber"::text = ANY(
-          ARRAY(
-            SELECT TRIM(val)
-            FROM unnest(string_to_array(REPLACE(COALESCE(b."PolicyList", ''), ' ', ''), ',')) AS val
-            WHERE TRIM(val) <> ''
+      WHERE (
+        (
+          m."EndorsementTypeCode" = '02'
+          AND m."TechnicalSheetNumber"::text = ANY(
+            ARRAY(
+              SELECT TRIM(val)
+              FROM unnest(string_to_array(REPLACE(COALESCE(b."PolicyList", ''), ' ', ''), ',')) AS val
+              WHERE TRIM(val) <> ''
+            )
           )
         )
+        OR (
+          NULLIF(TRIM(COALESCE(b."PolicyGroupCode"::text, '')), '') IS NOT NULL
+          AND m."PolicyGroupCode"::text = TRIM(b."PolicyGroupCode"::text)
+        )
+      )
     ) mp ON TRUE
   `;
 
@@ -1562,6 +1574,7 @@ async function getRenewals({
          b."BatchId", b."PolicyGroup", b."PolicyGroupCode",
          b."BrokerName" AS "brokerName",
          TO_CHAR(b."EffectiveDate", 'DD-MM-YYYY') AS "EffectiveDate",
+         TO_CHAR(mp.expiry_date, 'DD-MM-YYYY') AS "ExpiryDate",
          b."BatchName", b."BatchStatus",
          b."ExpiringTPA", b."ExpiringBroker", b."ExpiringDIN",
          COALESCE(NULLIF(b."ExpiringPremium"::float, 0), mp.total_premium, 0)::float AS "ExpiringPremium",
