@@ -10,8 +10,9 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Mount management routes at /api/management
+// Mount management routes (gateway may forward /api/management or /management)
 app.use("/management", router);
+app.use("/api/management", router);
 
 // Health Check
 app.get("/health", (req, res) => {

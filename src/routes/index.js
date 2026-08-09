@@ -12,6 +12,7 @@ const medicalRouter = require("./management/medical.controller");
 const notificationsRouter = require("./management/notifications.controller");
 const exportsRouter = require("./management/exports.controller");
 const hrmsRouter = require("./management/hrms.controller");
+const opsRouter = require("./management/ops.controller");
 
 const router = Router();
 
@@ -28,5 +29,6 @@ router.use(medicalRouter); // Medical Insights overview / doctor load
 router.use(notificationsRouter);
 router.use(exportsRouter); // Scheduled / on-demand CSV export + audit log
 router.use(hrmsRouter); // HRMS leave / workflow / oversight proxies
+router.use(opsRouter); // Operations / Booking / AML Insights
 
 module.exports = router;

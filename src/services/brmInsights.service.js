@@ -1846,20 +1846,24 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
     ),
     query(
       `SELECT COALESCE(SUM("GrossPremium"), 0)::float AS "bookedPremium",
-              COUNT(*)::int AS "bookedCount"
+              COUNT(*)::int AS "bookedCount",
+              COUNT(DISTINCT "TechnicalSheetNumber")::int AS "bookedSheetCount"
        FROM public."MasterDataLayer"
        WHERE UPPER(TRIM("NewOrRenewal")) = 'NEW'
          AND COALESCE("EventNbr"::int, 1) = 1
          AND "PolicyEffectiveDate" >= $1::date
          AND "PolicyEffectiveDate" <= $2::date`,
       bookedParams,
-    ).catch(() => [{ bookedPremium: 0, bookedCount: 0 }]),
+    ).catch(() => [{ bookedPremium: 0, bookedCount: 0, bookedSheetCount: 0 }]),
   ]);
 
   const p = pipeline[0] || {};
   const renewalSnap = renewalRows[0] || {};
   const bookedPremium = toNumber(bookedRows[0]?.bookedPremium);
-  const bookedCount = toNumber(bookedRows[0]?.bookedCount);
+  // All Summary style: distinct technical sheets, not raw MDL member rows
+  const bookedCount = toNumber(
+    bookedRows[0]?.bookedSheetCount ?? bookedRows[0]?.bookedCount,
+  );
   const execTotals = byExecutive.totals || {};
   const topBrms = [...byExecutive.executives]
     .sort((a, b) => toNumber(b.brmTotal) - toNumber(a.brmTotal))
