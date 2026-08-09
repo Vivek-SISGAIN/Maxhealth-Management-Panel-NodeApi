@@ -8,10 +8,6 @@ const opsProxy = require("../../services/opsProxy.service");
 
 const router = Router();
 
-function aedHint(n) {
-  return `AED ${Number(n || 0).toLocaleString("en-AE", { maximumFractionDigits: 0 })}`;
-}
-
 /** GET /management/ops/overview */
 router.get("/ops/overview", async (req, res) => {
   try {
@@ -55,7 +51,12 @@ router.get("/ops/overview", async (req, res) => {
 /** GET /management/ops/cases?mode=operations|ops-sla */
 router.get("/ops/cases", async (req, res) => {
   try {
-    const mode = req.query.mode === "ops-sla" ? "ops-sla" : "operations";
+    const mode =
+      req.query.mode === "ops-sla"
+        ? "ops-sla"
+        : req.query.mode === "operations-active"
+          ? "operations-active"
+          : "operations";
     const data = await opsInsights.listCases({
       mode,
       page: req.query.page,
@@ -63,6 +64,8 @@ router.get("/ops/cases", async (req, res) => {
       search: req.query.search,
       dateFrom: req.query.dateFrom,
       dateTo: req.query.dateTo,
+      booked: req.query.booked,
+      stage: req.query.stage,
     });
     res.json({ success: true, data });
   } catch (err) {
@@ -127,6 +130,8 @@ router.get("/booking/cases", async (req, res) => {
       search: req.query.search,
       dateFrom: req.query.dateFrom,
       dateTo: req.query.dateTo,
+      booked: req.query.booked,
+      stage: req.query.stage,
     });
     res.json({ success: true, data });
   } catch (err) {
@@ -147,8 +152,13 @@ router.get("/aml/overview", async (req, res) => {
         available: true,
         kpis: [
           { id: "queue", label: "AML queue", value: kpis.pendingAml, hint: "Stages 1–4 ⊂ Ops" },
-          { id: "cleared", label: "Past AML", value: kpis.bookingProgress + kpis.stageCompleted + kpis.opsBooked },
-          { id: "opsTotal", label: "Ops confirmed", value: kpis.total, hint: "Unique — do not add AML" },
+          {
+            id: "cleared",
+            label: "Past AML",
+            value: kpis.bookingProgress + kpis.stageCompleted,
+            hint: "Stages ≥ 5",
+          },
+          { id: "opsTotal", label: "Ops confirmed", value: kpis.total, hint: "Unique Status=3" },
           { id: "opsBooked", label: "Ops booked", value: kpis.opsBooked },
           {
             id: "amlPrem",
@@ -157,10 +167,8 @@ router.get("/aml/overview", async (req, res) => {
             format: "aed",
             hint: "CPS net",
           },
-          { id: "note", label: "Rule", value: "AML ⊂ Operations", format: "text" },
         ],
         stats: kpis,
-        note: aedHint(kpis.amlPremium),
       },
     });
   } catch (err) {
@@ -180,6 +188,8 @@ router.get("/aml/queue", async (req, res) => {
       search: req.query.search,
       dateFrom: req.query.dateFrom,
       dateTo: req.query.dateTo,
+      booked: req.query.booked,
+      stage: req.query.stage,
     });
     res.json({ success: true, data });
   } catch (err) {

@@ -1,6 +1,7 @@
 /**
- * Management Ops / Booking / AML Insights — DB-backed lists + KPIs.
- * Premium = CasePremiumSummary."NetPremium" only (no TargetPremium fallback).
+ * Management Ops / Booking / AML Insights — fast DB-backed lists + KPIs.
+ * Premium = CasePremiumSummary."NetPremium" only (no TargetPremium).
+ * Ops universe = Status=3 unique cases (AML stages are a subset, never added on top).
  */
 const { prisma } = require("../lib/prisma");
 
@@ -20,159 +21,102 @@ function stageLabel(code, bookingStatus) {
   return `Stage ${n}`;
 }
 
-const BASE_CASE = `
+const BASE = `
   COALESCE(qc."IsDeleted", false) = false
   AND COALESCE(qc."IsArchived", false) = false
 `;
 
-/** Latest version per DisplayID base + CPS net only */
-function latestCte({ whereExtra = "", search = "", dateFrom, dateTo, params }) {
-  const conds = [BASE_CASE, whereExtra].filter(Boolean);
+function dateConds(dateFrom, dateTo, params) {
+  const out = [];
   if (dateFrom) {
     params.push(dateFrom);
-    conds.push(`qc."CreateDate"::date >= $${params.length}::date`);
+    out.push(`qc."CreateDate"::date >= $${params.length}::date`);
   }
   if (dateTo) {
     params.push(dateTo);
-    conds.push(`qc."CreateDate"::date <= $${params.length}::date`);
+    out.push(`qc."CreateDate"::date <= $${params.length}::date`);
   }
-  if (search && String(search).trim()) {
-    params.push(`%${String(search).trim()}%`);
-    const p = params.length;
-    conds.push(`(
-      qc."DisplayID" ILIKE $${p}
-      OR COALESCE(comp."Name", '') ILIKE $${p}
-      OR COALESCE(crm."PolicyHolder", '') ILIKE $${p}
-    )`);
-  }
-
-  return {
-    sql: `
-    WITH latest AS (
-      SELECT DISTINCT ON (REGEXP_REPLACE(COALESCE(qc."DisplayID", qc."ID"::text), '-V[0-9]+$', ''))
-        qc."ID",
-        qc."DisplayID",
-        qc."Status",
-        qc."BookingStatus",
-        qc."CaseProgressStatus",
-        qc."CreateDate",
-        qc."LastUpdateDate",
-        qc."AssignedBrmExecutive",
-        COALESCE(NULLIF(cps."NetPremium"::float, 0), 0)::float AS net_premium,
-        COALESCE(NULLIF(TRIM(crm."PolicyHolder"), ''), NULLIF(TRIM(comp."Name"), ''), '—') AS client_name
-      FROM public."HealthInsuranceQuotationCase" qc
-      LEFT JOIN public."CasePremiumSummary" cps ON cps."CaseID" = qc."ID"
-      LEFT JOIN public."Company" comp ON comp."ID" = qc."ClientID"
-      LEFT JOIN LATERAL (
-        SELECT c."PolicyHolder"
-        FROM public."HealthInsurancePolicyCRM" c
-        WHERE c."HealthInsuranceQuotationCaseID" = qc."ID"
-        LIMIT 1
-      ) crm ON true
-      WHERE ${conds.join(" AND ")}
-      ORDER BY
-        REGEXP_REPLACE(COALESCE(qc."DisplayID", qc."ID"::text), '-V[0-9]+$', ''),
-        COALESCE(cps."NetPremium", 0) DESC,
-        qc."ID" DESC
-    )
-    `,
-    params,
-  };
+  return out;
 }
 
-async function getOpsBookedStats({ dateFrom, dateTo } = {}) {
-  const params = [];
-  const { sql } = latestCte({
-    whereExtra: `COALESCE(qc."BookingStatus", false) = true`,
-    dateFrom,
-    dateTo,
-    params,
-  });
-  try {
-    const rows = await prisma.$queryRawUnsafe(
-      `${sql}
-       SELECT COUNT(*)::int AS "bookedCount",
-              COALESCE(SUM(net_premium), 0)::float AS "bookedPremium"
-       FROM latest`,
-      ...params,
-    );
-    return {
-      bookedCount: toNum(rows?.[0]?.bookedCount),
-      bookedPremium: toNum(rows?.[0]?.bookedPremium),
-    };
-  } catch (e) {
-    console.warn("[opsInsights] ops booked failed:", e?.message || e);
-    return { bookedCount: 0, bookedPremium: 0 };
+function modeWhere(mode) {
+  // All modes sit inside Status=3 (confirmed / ops universe)
+  let w = `qc."Status" = 3`;
+  if (mode === "ops-sla") {
+    w += ` AND qc."CaseProgressStatus" = 0 AND qc."CreateDate" <= NOW() - INTERVAL '7 days'`;
+  } else if (mode === "booking" || mode === "booking-pipeline") {
+    // Booking stages only — excludes AML subset (1–4)
+    w += ` AND qc."CaseProgressStatus" >= 5 AND qc."CaseProgressStatus" < 12`;
+  } else if (mode === "booking-completed") {
+    w += ` AND COALESCE(qc."BookingStatus", false) = true`;
+  } else if (mode === "aml") {
+    w += ` AND qc."CaseProgressStatus" >= 1 AND qc."CaseProgressStatus" <= 4`;
+  } else if (mode === "aml-cleared") {
+    w += ` AND qc."CaseProgressStatus" >= 5`;
+  } else if (mode === "operations-active") {
+    // Confirmed ops queue still in progress (not fully booked)
+    w += ` AND COALESCE(qc."BookingStatus", false) = false`;
   }
+  return w;
 }
 
 /**
- * Won / Confirmed = ALL Status=3 cases (Ops-booked + not booked).
- * Premium = CPS NetPremium only.
- */
-async function getConfirmedNotBookedStats({ dateFrom, dateTo } = {}) {
-  const params = [];
-  const { sql } = latestCte({
-    whereExtra: `
-      qc."Status" = 3
-      AND qc."DisplayID" ~ '-[BD][0-9]+'
-    `,
-    dateFrom,
-    dateTo,
-    params,
-  });
-  try {
-    const rows = await prisma.$queryRawUnsafe(
-      `${sql}
-       SELECT COUNT(*)::int AS "confirmedCount",
-              COALESCE(SUM(net_premium), 0)::float AS "confirmedPremium"
-       FROM latest`,
-      ...params,
-    );
-    return {
-      confirmedCount: toNum(rows?.[0]?.confirmedCount),
-      confirmedPremium: toNum(rows?.[0]?.confirmedPremium),
-    };
-  } catch (e) {
-    console.warn("[opsInsights] confirmed/won failed:", e?.message || e);
-    return { confirmedCount: 0, confirmedPremium: 0 };
-  }
-}
-
-/**
- * Aggregate KPIs for Operations / Booking / AML overviews.
+ * Fast KPI path — no Company / CRM joins. Distinct latest version + CPS net.
  */
 async function getDeptKpis({ dateFrom, dateTo } = {}) {
   const params = [];
-  const { sql } = latestCte({
-    whereExtra: `qc."Status" = 3`,
-    dateFrom,
-    dateTo,
-    params,
-  });
+  const extras = dateConds(dateFrom, dateTo, params);
+  const where = [BASE, `qc."Status" = 3`, ...extras].join(" AND ");
+
+  const sql = `
+    WITH scoped AS (
+      SELECT
+        qc."ID",
+        qc."BookingStatus",
+        qc."CaseProgressStatus",
+        qc."CreateDate",
+        REGEXP_REPLACE(COALESCE(qc."DisplayID", qc."ID"::text), '-V[0-9]+$', '') AS base_id,
+        CAST(
+          NULLIF(REGEXP_REPLACE(COALESCE(qc."DisplayID", ''), '^.*-V([0-9]+)$', '\\1'), COALESCE(qc."DisplayID", ''))
+          AS INT
+        ) AS version_num
+      FROM public."HealthInsuranceQuotationCase" qc
+      WHERE ${where}
+    ),
+    latest AS (
+      SELECT DISTINCT ON (base_id)
+        s."ID", s."BookingStatus", s."CaseProgressStatus", s."CreateDate"
+      FROM scoped s
+      ORDER BY base_id, version_num DESC NULLS LAST, s."ID" DESC
+    ),
+    priced AS (
+      SELECT
+        l.*,
+        COALESCE(NULLIF(cps."NetPremium"::float, 0), 0)::float AS net_premium
+      FROM latest l
+      LEFT JOIN public."CasePremiumSummary" cps ON cps."CaseID" = l."ID"
+    )
+    SELECT
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE COALESCE("BookingStatus", false) = true)::int AS ops_booked,
+      COUNT(*) FILTER (WHERE COALESCE("BookingStatus", false) = false)::int AS not_booked,
+      COUNT(*) FILTER (WHERE "CaseProgressStatus" = 0)::int AS fresh,
+      COUNT(*) FILTER (WHERE "CaseProgressStatus" >= 1 AND "CaseProgressStatus" <= 4)::int AS pending_aml,
+      COUNT(*) FILTER (WHERE "CaseProgressStatus" >= 5 AND "CaseProgressStatus" < 12)::int AS booking_progress,
+      COUNT(*) FILTER (WHERE "CaseProgressStatus" = 12)::int AS stage_completed,
+      COUNT(*) FILTER (
+        WHERE "CaseProgressStatus" = 0
+          AND "CreateDate" <= NOW() - INTERVAL '7 days'
+      )::int AS sla_alerts,
+      COALESCE(SUM(net_premium), 0)::float AS total_premium,
+      COALESCE(SUM(net_premium) FILTER (WHERE COALESCE("BookingStatus", false) = true), 0)::float AS booked_premium,
+      COALESCE(SUM(net_premium) FILTER (WHERE "CaseProgressStatus" >= 1 AND "CaseProgressStatus" <= 4), 0)::float AS aml_premium,
+      COALESCE(SUM(net_premium) FILTER (WHERE "CaseProgressStatus" >= 5 AND "CaseProgressStatus" < 12), 0)::float AS booking_premium
+    FROM priced
+  `;
 
   try {
-    const rows = await prisma.$queryRawUnsafe(
-      `${sql}
-       SELECT
-         COUNT(*)::int AS total,
-         COUNT(*) FILTER (WHERE COALESCE("BookingStatus", false) = true)::int AS ops_booked,
-         COUNT(*) FILTER (WHERE COALESCE("BookingStatus", false) = false)::int AS not_booked,
-         COUNT(*) FILTER (WHERE "CaseProgressStatus" = 0)::int AS fresh,
-         COUNT(*) FILTER (WHERE "CaseProgressStatus" >= 1 AND "CaseProgressStatus" <= 4)::int AS pending_aml,
-         COUNT(*) FILTER (WHERE "CaseProgressStatus" >= 5 AND "CaseProgressStatus" < 12)::int AS booking_progress,
-         COUNT(*) FILTER (WHERE "CaseProgressStatus" = 12)::int AS stage_completed,
-         COUNT(*) FILTER (
-           WHERE "CaseProgressStatus" = 0
-             AND "CreateDate" <= NOW() - INTERVAL '7 days'
-         )::int AS sla_alerts,
-         COALESCE(SUM(net_premium), 0)::float AS total_premium,
-         COALESCE(SUM(net_premium) FILTER (WHERE COALESCE("BookingStatus", false) = true), 0)::float AS booked_premium,
-         COALESCE(SUM(net_premium) FILTER (WHERE "CaseProgressStatus" >= 1 AND "CaseProgressStatus" <= 4), 0)::float AS aml_premium,
-         COALESCE(SUM(net_premium) FILTER (WHERE "CaseProgressStatus" >= 5 AND "CaseProgressStatus" < 12), 0)::float AS booking_premium
-       FROM latest`,
-      ...params,
-    );
+    const rows = await prisma.$queryRawUnsafe(sql, ...params);
     const r = rows?.[0] || {};
     return {
       total: toNum(r.total),
@@ -207,9 +151,19 @@ async function getDeptKpis({ dateFrom, dateTo } = {}) {
   }
 }
 
+async function getOpsBookedStats(opts) {
+  const k = await getDeptKpis(opts);
+  return { bookedCount: k.opsBooked, bookedPremium: k.bookedPremium };
+}
+
+async function getConfirmedNotBookedStats({ dateFrom, dateTo } = {}) {
+  // Won = ALL Status=3 (booked + not booked)
+  const k = await getDeptKpis({ dateFrom, dateTo });
+  return { confirmedCount: k.total, confirmedPremium: k.totalPremium };
+}
+
 /**
- * Paginated case list.
- * mode: operations | ops-sla | booking | booking-pipeline | booking-completed | aml | aml-cleared
+ * Paginated list — filter early, distinct latest, page, then enrich client/CPS.
  */
 async function listCases({
   mode = "operations",
@@ -218,75 +172,126 @@ async function listCases({
   search = "",
   dateFrom,
   dateTo,
+  booked, // all | yes | no
+  stage, // fresh | aml | booking | completed | all
 } = {}) {
   const p = Math.max(1, parseInt(page, 10) || 1);
   const lim = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
   const offset = (p - 1) * lim;
 
-  let whereExtra = `qc."Status" = 3`;
-  if (mode === "ops-sla") {
-    whereExtra += ` AND qc."CaseProgressStatus" = 0 AND qc."CreateDate" <= NOW() - INTERVAL '7 days'`;
-  } else if (mode === "booking" || mode === "booking-pipeline") {
-    whereExtra += ` AND qc."CaseProgressStatus" >= 5 AND qc."CaseProgressStatus" < 12`;
-  } else if (mode === "booking-completed") {
-    whereExtra += ` AND COALESCE(qc."BookingStatus", false) = true`;
-  } else if (mode === "aml") {
-    whereExtra += ` AND qc."CaseProgressStatus" >= 1 AND qc."CaseProgressStatus" <= 4`;
-  } else if (mode === "aml-cleared") {
-    whereExtra += ` AND qc."CaseProgressStatus" >= 5`;
+  const params = [];
+  const extras = [modeWhere(mode), ...dateConds(dateFrom, dateTo, params)];
+
+  if (booked === "yes") extras.push(`COALESCE(qc."BookingStatus", false) = true`);
+  if (booked === "no") extras.push(`COALESCE(qc."BookingStatus", false) = false`);
+
+  if (stage === "fresh") extras.push(`qc."CaseProgressStatus" = 0`);
+  else if (stage === "aml") extras.push(`qc."CaseProgressStatus" BETWEEN 1 AND 4`);
+  else if (stage === "booking") extras.push(`qc."CaseProgressStatus" BETWEEN 5 AND 11`);
+  else if (stage === "completed") extras.push(`qc."CaseProgressStatus" = 12`);
+
+  if (search && String(search).trim()) {
+    params.push(`%${String(search).trim()}%`);
+    const i = params.length;
+    extras.push(`(
+      qc."DisplayID" ILIKE $${i}
+      OR EXISTS (
+        SELECT 1 FROM public."Company" c
+        WHERE c."ID" = qc."ClientID" AND c."Name" ILIKE $${i}
+      )
+    )`);
   }
 
-  const params = [];
-  const { sql } = latestCte({
-    whereExtra,
-    search,
-    dateFrom,
-    dateTo,
-    params,
-  });
+  const where = [BASE, ...extras].join(" AND ");
 
-  const countParams = [...params];
-  const dataParams = [...params, lim, offset];
-  const limIdx = params.length + 1;
-  const offIdx = params.length + 2;
+  const cte = `
+    WITH scoped AS (
+      SELECT
+        qc."ID",
+        qc."DisplayID",
+        qc."Status",
+        qc."BookingStatus",
+        qc."CaseProgressStatus",
+        qc."CreateDate",
+        qc."LastUpdateDate",
+        qc."AssignedBrmExecutive",
+        qc."ClientID",
+        REGEXP_REPLACE(COALESCE(qc."DisplayID", qc."ID"::text), '-V[0-9]+$', '') AS base_id,
+        CAST(
+          NULLIF(REGEXP_REPLACE(COALESCE(qc."DisplayID", ''), '^.*-V([0-9]+)$', '\\1'), COALESCE(qc."DisplayID", ''))
+          AS INT
+        ) AS version_num
+      FROM public."HealthInsuranceQuotationCase" qc
+      WHERE ${where}
+    ),
+    latest AS (
+      SELECT DISTINCT ON (base_id) *
+      FROM scoped
+      ORDER BY base_id, version_num DESC NULLS LAST, "ID" DESC
+    )
+  `;
 
   try {
-    const [countRows, dataRows] = await Promise.all([
+    const [countRows, idRows] = await Promise.all([
+      prisma.$queryRawUnsafe(`${cte} SELECT COUNT(*)::int AS total FROM latest`, ...params),
       prisma.$queryRawUnsafe(
-        `${sql} SELECT COUNT(*)::int AS total FROM latest`,
-        ...countParams,
-      ),
-      prisma.$queryRawUnsafe(
-        `${sql}
-         SELECT * FROM latest
+        `${cte}
+         SELECT "ID" FROM latest
          ORDER BY "LastUpdateDate" DESC NULLS LAST, "ID" DESC
-         LIMIT $${limIdx} OFFSET $${offIdx}`,
-        ...dataParams,
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        ...params,
+        lim,
+        offset,
       ),
     ]);
 
     const total = toNum(countRows?.[0]?.total);
-    const items = (dataRows || []).map((row) => ({
-      id: row.ID,
-      displayId: row.DisplayID || "—",
-      clientName: row.client_name || "—",
-      status: row.Status,
-      bookingStatus: Boolean(row.BookingStatus),
-      caseProgressStatus: row.CaseProgressStatus,
-      premium: toNum(row.net_premium),
-      createDate: row.CreateDate,
-      lastUpdate: row.LastUpdateDate,
-      assignedBrm: row.AssignedBrmExecutive,
-      stageLabel: stageLabel(row.CaseProgressStatus, row.BookingStatus),
-    }));
+    const ids = (idRows || []).map((r) => r.ID).filter(Boolean);
+    if (!ids.length) {
+      return { items: [], total, page: p, limit: lim, available: true };
+    }
 
-    return {
-      items,
-      total,
-      page: p,
-      limit: lim,
-      available: true,
-    };
+    const detailSql = `
+      SELECT
+        qc."ID",
+        qc."DisplayID",
+        qc."Status",
+        qc."BookingStatus",
+        qc."CaseProgressStatus",
+        qc."CreateDate",
+        qc."LastUpdateDate",
+        qc."AssignedBrmExecutive",
+        COALESCE(NULLIF(cps."NetPremium"::float, 0), 0)::float AS net_premium,
+        COALESCE(NULLIF(TRIM(comp."Name"), ''), '—') AS client_name
+      FROM public."HealthInsuranceQuotationCase" qc
+      LEFT JOIN public."CasePremiumSummary" cps ON cps."CaseID" = qc."ID"
+      LEFT JOIN public."Company" comp ON comp."ID" = qc."ClientID"
+      WHERE qc."ID"::text = ANY($1::text[])
+    `;
+    const details = await prisma.$queryRawUnsafe(
+      detailSql,
+      ids.map((x) => String(x)),
+    );
+
+    const byId = new Map((details || []).map((r) => [String(r.ID), r]));
+    const items = ids.map((id) => {
+      const row = byId.get(String(id)) || {};
+      return {
+        id: row.ID || id,
+        displayId: row.DisplayID || "—",
+        clientName: row.client_name || "—",
+        status: row.Status,
+        bookingStatus: Boolean(row.BookingStatus),
+        caseProgressStatus: row.CaseProgressStatus,
+        premium: toNum(row.net_premium),
+        createDate: row.CreateDate,
+        lastUpdate: row.LastUpdateDate,
+        assignedBrm: row.AssignedBrmExecutive,
+        stageLabel: stageLabel(row.CaseProgressStatus, row.BookingStatus),
+      };
+    });
+
+    return { items, total, page: p, limit: lim, available: true };
   } catch (e) {
     console.warn("[opsInsights] list failed:", e?.message || e);
     return { items: [], total: 0, page: p, limit: lim, available: false, error: e?.message };
