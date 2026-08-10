@@ -10,6 +10,18 @@ const OPS_BASE = (
   "http://localhost:2807"
 ).replace(/\/$/, "");
 
+/** Production Docker: /operations. Local dev: /api/operations. Override with OPS_API_PREFIX. */
+const OPS_API_PREFIX = (
+  process.env.OPS_API_PREFIX !== undefined
+    ? process.env.OPS_API_PREFIX
+    : OPS_BASE.includes("operations-service")
+      ? ""
+      : "/api"
+).replace(/\/$/, "");
+
+const OPS_OPERATIONS_PATH = `${OPS_API_PREFIX}/operations`;
+const OPS_AML_NEW_BOOKINGS_PATH = `${OPS_API_PREFIX}/aml/new-bookings`;
+
 const TIMEOUT_MS = Math.max(
   parseInt(process.env.OPS_PROXY_TIMEOUT_MS || "60000", 10) || 60000,
   15000,
@@ -46,7 +58,7 @@ async function getJson(path, { query, headers } = {}) {
 
 /** Booking / operations pipeline aggregates (counts only — no premium on list API). */
 async function getOperationsSnapshot(headers = {}) {
-  const raw = await getJson("/api/operations", {
+  const raw = await getJson(OPS_OPERATIONS_PATH, {
     query: { page: 1, limit: 1 },
     headers,
   });
@@ -63,7 +75,7 @@ async function getOperationsSnapshot(headers = {}) {
 
 /** AML new-booking queue size. */
 async function getAmlSnapshot(headers = {}) {
-  const raw = await getJson("/api/aml/new-bookings", {
+  const raw = await getJson(OPS_AML_NEW_BOOKINGS_PATH, {
     query: { page: 1, limit: 1 },
     headers,
   });
@@ -87,7 +99,7 @@ async function getOpsInsights(headers = {}) {
 
 /** Paginated Operations / Booking cases (Status=3 universe). */
 async function listOperations(headers = {}, query = {}) {
-  const raw = await getJson("/api/operations", {
+  const raw = await getJson(OPS_OPERATIONS_PATH, {
     query: {
       page: query.page || 1,
       limit: query.limit || 20,
@@ -115,7 +127,7 @@ async function listOperations(headers = {}, query = {}) {
 
 /** Paginated AML new-bookings queue. */
 async function listAml(headers = {}, query = {}) {
-  const raw = await getJson("/api/aml/new-bookings", {
+  const raw = await getJson(OPS_AML_NEW_BOOKINGS_PATH, {
     query: {
       page: query.page || 1,
       limit: query.limit || 20,
