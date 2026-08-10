@@ -66,6 +66,7 @@ router.get("/ops/cases", async (req, res) => {
       dateTo: req.query.dateTo,
       booked: req.query.booked,
       stage: req.query.stage,
+      amlStatus: req.query.amlStatus,
     });
     res.json({ success: true, data });
   } catch (err) {
@@ -85,11 +86,11 @@ router.get("/booking/overview", async (req, res) => {
       data: {
         available: true,
         kpis: [
-          { id: "pipeline", label: "Booking pipeline", value: kpis.bookingProgress, hint: "Stages 5–11" },
+          { id: "pipeline", label: "Booking pipeline", value: kpis.bookingInProgress, hint: "Stages 5–11 not booked" },
           { id: "opsBooked", label: "Fully booked", value: kpis.opsBooked, hint: "BookingStatus" },
           { id: "completed", label: "Stage completed", value: kpis.stageCompleted },
           { id: "fresh", label: "Fresh", value: kpis.fresh },
-          { id: "pendingAml", label: "Still in AML", value: kpis.pendingAml },
+          { id: "pendingAml", label: "Still in AML stages", value: kpis.pendingAml },
           { id: "sla", label: "SLA alerts", value: kpis.slaAlerts },
           {
             id: "bookingPrem",
@@ -132,6 +133,7 @@ router.get("/booking/cases", async (req, res) => {
       dateTo: req.query.dateTo,
       booked: req.query.booked,
       stage: req.query.stage,
+      amlStatus: req.query.amlStatus,
     });
     res.json({ success: true, data });
   } catch (err) {
@@ -151,22 +153,12 @@ router.get("/aml/overview", async (req, res) => {
       data: {
         available: true,
         kpis: [
-          { id: "queue", label: "AML queue", value: kpis.pendingAml, hint: "Stages 1–4 ⊂ Ops" },
-          {
-            id: "cleared",
-            label: "Past AML",
-            value: kpis.bookingProgress + kpis.stageCompleted,
-            hint: "Stages ≥ 5",
-          },
+          { id: "sent", label: "Sent to AML", value: kpis.amlSentTotal, hint: "KYC sent to AML" },
+          { id: "pending", label: "Pending", value: kpis.amlPending, hint: "CaseStatusByAmlDin=0" },
+          { id: "partial", label: "Partially approved", value: kpis.amlPartial, hint: "Status=2" },
+          { id: "approved", label: "Approved", value: kpis.amlApproved, hint: "Status=1" },
+          { id: "rejected", label: "Rejected", value: kpis.amlRejected, hint: "Status=3" },
           { id: "opsTotal", label: "Ops confirmed", value: kpis.total, hint: "Unique Status=3" },
-          { id: "opsBooked", label: "Ops booked", value: kpis.opsBooked },
-          {
-            id: "amlPrem",
-            label: "AML queue premium",
-            value: kpis.amlPremium,
-            format: "aed",
-            hint: "CPS net",
-          },
         ],
         stats: kpis,
       },
@@ -190,6 +182,7 @@ router.get("/aml/queue", async (req, res) => {
       dateTo: req.query.dateTo,
       booked: req.query.booked,
       stage: req.query.stage,
+      amlStatus: req.query.amlStatus,
     });
     res.json({ success: true, data });
   } catch (err) {

@@ -2,10 +2,23 @@ const { Router } = require("express");
 const { prisma } = require("../../lib/prisma");
 const brm = require("../../services/brmInsights.service");
 const medical = require("../../services/medicalInsights.service");
+const opsInsights = require("../../services/opsInsights.service");
 const opsProxy = require("../../services/opsProxy.service");
 const hrmsProxy = require("../../services/hrmsProxy.service");
-const casePremiumStats = require("../../services/casePremiumStats.service");
+const executiveCache = require("../../services/executiveCache");
+const { DATE_POLICY_META } = require("../../services/managementDatePolicy");
 const router = Router();
+
+const EXEC_HRMS_TIMEOUT_MS = Math.max(
+  parseInt(process.env.EXEC_HRMS_TIMEOUT_MS || "4000", 10) || 4000,
+  1000,
+);
+const EXEC_SECONDARY_TIMEOUT_MS = Math.max(
+  parseInt(process.env.EXEC_SECONDARY_TIMEOUT_MS || "5000", 10) || 5000,
+  1000,
+);
+const EXEC_OPS_PROXY =
+  String(process.env.EXEC_OVERVIEW_OPS_PROXY || "false").toLowerCase() === "true";
 
 const aed = (n) => {
   const v = Number(n) || 0;
@@ -33,7 +46,7 @@ async function collectPendingMedicalApprovals(limit = 8) {
     where: { TaskType: "UNDERWRITING" },
     select: { Id: true, CaseId: true, Metadata: true, Priority: true, SlaDeadline: true, UpdatedAt: true },
     orderBy: { UpdatedAt: "desc" },
-    take: 200,
+    take: 80,
   });
   const out = [];
   let urgent = 0;
@@ -81,29 +94,89 @@ async function buildTrend() {
   }
   const start = new Date(months[0].year, months[0].month, 1);
 
-  const [cases, tasks] = await Promise.all([
-    prisma.underwritingCase.findMany({
-      where: { CreatedAt: { gte: start } },
-      select: { CreatedAt: true },
-    }),
-    prisma.medicalTask.findMany({
-      where: { TaskType: "UNDERWRITING", CreatedAt: { gte: start } },
-      select: { CreatedAt: true, SlaBreach: true },
-    }),
+  const [caseRows, taskRows] = await Promise.all([
+    prisma.$queryRaw`
+      SELECT
+        date_trunc('month', "CreatedAt") AS bucket,
+        COUNT(*)::int AS cnt
+      FROM "UnderwritingCase"
+      WHERE "CreatedAt" >= ${start}
+      GROUP BY 1
+    `,
+    prisma.$queryRaw`
+      SELECT
+        date_trunc('month', "CreatedAt") AS bucket,
+        COUNT(*)::int AS cnt
+      FROM "MedicalTask"
+      WHERE "TaskType" = 'UNDERWRITING'
+        AND "SlaBreach" = true
+        AND "CreatedAt" >= ${start}
+      GROUP BY 1
+    `,
   ]);
 
-  return months.map((m) => {
-    const caseCount = cases.filter((c) => {
-      const x = new Date(c.CreatedAt);
-      return x.getFullYear() === m.year && x.getMonth() === m.month;
-    }).length;
-    const slaBreach = tasks.filter((t) => {
-      if (!t.SlaBreach) return false;
-      const x = new Date(t.CreatedAt);
-      return x.getFullYear() === m.year && x.getMonth() === m.month;
-    }).length;
-    return { period: m.label, medicalCases: caseCount, slaBreach, label: m.key };
-  });
+  const caseMap = new Map(
+    (caseRows || []).map((r) => {
+      const d = new Date(r.bucket);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      return [key, Number(r.cnt || 0)];
+    }),
+  );
+  const slaMap = new Map(
+    (taskRows || []).map((r) => {
+      const d = new Date(r.bucket);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      return [key, Number(r.cnt || 0)];
+    }),
+  );
+
+  return months.map((m) => ({
+    period: m.label,
+    medicalCases: caseMap.get(m.key) || 0,
+    slaBreach: slaMap.get(m.key) || 0,
+    label: m.key,
+  }));
+}
+
+function withTimeout(promise, ms, label = "timeout") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`${label} after ${ms}ms`)), ms);
+    }),
+  ]);
+}
+
+function softTimeout(promise, ms, fallback = null, label = "secondary") {
+  return Promise.race([
+    promise.catch((e) => {
+      console.warn(`[executive] ${label} failed:`, e?.message || e);
+      return fallback;
+    }),
+    new Promise((resolve) => {
+      setTimeout(() => {
+        console.warn(`[executive] ${label} soft-timeout ${ms}ms — continuing with live KPIs`);
+        resolve(fallback);
+      }, ms);
+    }),
+  ]);
+}
+
+async function fetchHrmsOverview(headers) {
+  try {
+    const [approvalStats, dashboard] = await withTimeout(
+      Promise.all([
+        hrmsProxy.approvalStats(headers),
+        hrmsProxy.hrOpsDashboard(headers),
+      ]),
+      EXEC_HRMS_TIMEOUT_MS,
+      "HRMS proxy",
+    );
+    return { approvalStats, dashboard };
+  } catch (e) {
+    console.warn("[executive] HRMS skipped:", e?.message || e);
+    return null;
+  }
 }
 
 function scoreLabel(score) {
@@ -142,82 +215,91 @@ async function buildExecutive(req) {
   const dateTo = req.query.dateTo || req.query.to || undefined;
   const headers = req.headers || {};
 
+  const cached = executiveCache.get(dateFrom, dateTo);
+  if (cached) return cached;
+
+  const t0 = Date.now();
+
+  // Critical live KPIs (must complete) — secondary charts/HR soft-timeout so they never block.
   const [
     brmSnap,
     medSnap,
     pendingPack,
     activeAlerts,
-    caseStats,
-    taskStats,
     trend,
-    depts,
-    opsInsights,
+    opsKpis,
     lostMix,
     hrmsOverview,
-    opsBookedStats,
-    confirmedStats,
   ] = await Promise.all([
-    brm.getOverviewSnapshot({ dateFrom, dateTo }).catch(() => null),
-    medical.getOverviewSnapshot({ dateFrom, dateTo }).catch(() => null),
-    collectPendingMedicalApprovals(6),
-    prisma.managementAlert.findMany({
-      where: { Status: { in: ["active", "acknowledged", "resolved"] } },
-      orderBy: { CreatedAt: "desc" },
-      take: 8,
+    brm.getExecutiveSnapshot({ dateFrom, dateTo }).catch((e) => {
+      console.warn("[executive] BRM snapshot failed:", e?.message || e);
+      return null;
     }),
-    Promise.all([
-      prisma.underwritingCase.count(),
-      prisma.underwritingCase.count({ where: { Status: "NEW" } }),
-      prisma.underwritingCase.count({ where: { Status: "IN_REVIEW" } }),
-      prisma.underwritingCase.count({ where: { Status: "COMPLETED" } }),
-    ]),
-    Promise.all([
-      prisma.medicalTask.count({ where: { TaskType: "UNDERWRITING" } }),
-      prisma.medicalTask.count({ where: { TaskType: "UNDERWRITING", Status: "IN_PROGRESS" } }),
-      prisma.medicalTask.count({ where: { TaskType: "UNDERWRITING", SlaBreach: true } }),
-      prisma.medicalTask.count({ where: { TaskType: "UNDERWRITING", Status: "PENDING" } }),
-    ]),
+    medical.getExecutiveCounts({ dateFrom, dateTo }).catch((e) => {
+      console.warn("[executive] medical counts failed:", e?.message || e);
+      return null;
+    }),
+    collectPendingMedicalApprovals(6),
+    prisma.managementAlert
+      .findMany({
+        where: { Status: { in: ["active", "acknowledged", "resolved"] } },
+        orderBy: { CreatedAt: "desc" },
+        take: 8,
+      })
+      .catch(() => []),
     buildTrend(),
-    prisma.managementDepartmentMetric.findMany({
-      orderBy: { RecordedAt: "desc" },
-      take: 40,
-    }).catch(() => []),
-    opsProxy.getOpsInsights(headers).catch(() => ({ available: false })),
-    typeof brm.getLostReasonMix === "function"
-      ? brm.getLostReasonMix({ dateFrom, dateTo }).catch(() => null)
-      : Promise.resolve(null),
-    Promise.all([
-      hrmsProxy.approvalStats(headers).catch(() => null),
-      hrmsProxy.hrOpsDashboard(headers).catch(() => null),
-    ])
-      .then(([approvalStats, dashboard]) => ({ approvalStats, dashboard }))
-      .catch(() => null),
-    casePremiumStats.getOpsBookedStats({ dateFrom, dateTo }),
-    casePremiumStats.getConfirmedNotBookedStats({ dateFrom, dateTo }),
+    opsInsights.getDeptKpis({ dateFrom, dateTo }).catch((e) => {
+      console.warn("[executive] ops KPIs failed:", e?.message || e);
+      return null;
+    }),
+    softTimeout(
+      typeof brm.getLostReasonMix === "function"
+        ? brm.getLostReasonMix({ dateFrom, dateTo })
+        : Promise.resolve(null),
+      EXEC_SECONDARY_TIMEOUT_MS,
+      null,
+      "lost reasons",
+    ),
+    softTimeout(fetchHrmsOverview(headers), EXEC_HRMS_TIMEOUT_MS, null, "HRMS"),
   ]);
 
-  const [totalCases, newCases, inReview, completed] = caseStats;
-  const [uwTasks, tasksActive, slaBreached, tasksPending] = taskStats;
+  const opsLive = EXEC_OPS_PROXY
+    ? await softTimeout(
+        opsProxy.getOpsInsights(headers),
+        EXEC_SECONDARY_TIMEOUT_MS,
+        { available: false },
+        "ops proxy",
+      )
+    : { available: false, booking: null, aml: null };
+
+  const depts = [];
+  console.log(
+    `[executive] build ${Date.now() - t0}ms ` +
+      `ops=${opsKpis ? "ok" : "null"} brm=${brmSnap ? "ok" : "null"} ` +
+      `range=${dateFrom || "all"}->${dateTo || "all"}`,
+  );
+
+  const k = opsKpis || {};
+  const opsBookedCount = Number(k.opsBooked ?? 0);
+  const opsBookedPremium = Number(k.bookedPremium ?? 0);
+  const confirmedCount = Number(k.total ?? 0);
+  const confirmedPremium = Number(k.totalPremium ?? 0);
+
+  const medCards = medSnap?.cards || {};
+  const totalCases = Number(medCards.totalCases ?? 0);
+  const newCases = Number(medCards.newCases ?? 0);
+  const inReview = Number(medCards.inReview ?? 0);
+  const completed = Number(medCards.completed ?? medCards.byStatus?.completed ?? 0);
+  const slaBreached = Number(medCards.slaBreached ?? 0);
+  const uwTasks = Number(medCards.uwTasks ?? 0);
+  const tasksActive = Number(medCards.tasksInProgress ?? 0);
+  const tasksPending = Number(medCards.tasksPending ?? 0);
   const c = brmSnap?.cards || {};
 
   const openPipeline = Number(c.openPipelineCount ?? 0);
   const pipelinePremium = Number(c.openPremium ?? 0);
-
-  // Master production from BRM snapshot (now DISTINCT sheets) — not used as Ops booked count
   const masterBookedPremium = Number(c.bookedPremium ?? c.achievedTotal ?? 0);
   const masterBookedRows = Number(c.bookedCount ?? 0);
-
-  // Ops booked = BookingStatus true · CPS NetPremium (fallback TargetPremium)
-  const opsBookedCount = Number(opsBookedStats?.bookedCount ?? 0);
-  const opsBookedPremium = Number(opsBookedStats?.bookedPremium ?? 0);
-
-  // Won / Confirmed = Status=3 not yet Ops-booked · CPS NetPremium (All Summary)
-  const confirmedCount = Number(
-    confirmedStats?.confirmedCount ?? c.nbWon ?? 0,
-  );
-  const confirmedPremium = Number(
-    confirmedStats?.confirmedPremium ?? 0,
-  );
 
   const bookedCount = opsBookedCount;
   const bookedPremium = opsBookedPremium;
@@ -244,8 +326,8 @@ async function buildExecutive(req) {
     ((uwTotal - Math.min(slaBreached, uwTotal)) / uwTotal) * 1000,
   ) / 10;
 
-  const booking = opsInsights?.booking || null;
-  const aml = opsInsights?.aml || null;
+  const booking = opsLive?.booking || null;
+  const aml = opsLive?.aml || null;
   const hrLeavePending = Number(
     hrmsOverview?.approvalStats?.pending ??
       hrmsOverview?.dashboard?.leave?.pending ??
@@ -288,7 +370,7 @@ async function buildExecutive(req) {
       label: "Open pipeline",
       count: openPipeline,
       premium: pipelinePremium,
-      hint: "NB open · TargetPremium (pipeline)",
+      hint: "NB open · TargetPremium · policy start date",
       go: "brm-overview",
       tone: "navy",
     },
@@ -297,7 +379,7 @@ async function buildExecutive(req) {
       label: "Renewal portfolio",
       count: renCount,
       premium: renPremium,
-      hint: `Won ${renWon} · ${aed(renWonPremium)}`,
+      hint: `Won ${renWon} · ${aed(renWonPremium)} · policy expiry date`,
       go: "brm-renewals",
       tone: "teal",
     },
@@ -338,25 +420,34 @@ async function buildExecutive(req) {
     { name: "Ongoing", value: Number(c.nbOngoing ?? 0) },
     { name: "Won", value: wonCount },
     { name: "Lost", value: nbLost },
-  ].filter((x) => x.value > 0);
+  ];
 
-  const bookingTotal = Number(booking?.total ?? 0);
-  const bookingActive = Number(booking?.activeCase ?? 0);
-  const bookingProgress = Number(booking?.caseProgress ?? 0);
-  const bookingFresh = Number(booking?.freshcase ?? 0);
-  const bookingCompleted = Number(booking?.caseCompleted ?? 0);
-  const bookingSla = Number(booking?.slaalert ?? 0);
-  // pendingAml is a SUBSET of booking.total (stages 1–4) — never add to Operations
-  const bookingPendingAml = Number(booking?.pendingAml ?? 0);
-  const amlQueue = Number(aml?.total ?? 0);
-  // Prefer Ops pending-AML subset when AML API is empty / overlapping
-  const amlTotal = amlQueue > 0 ? amlQueue : bookingPendingAml;
-
-  // Unique confirmed cases in Operations (= Booking panel universe). Do NOT sum AML.
-  const opsTotal = bookingTotal;
-
-  // Booking-stage cases past AML (approx): in-progress minus pending AML, floored at 0
+  const opsTotal = Number(k.total ?? 0);
+  const bookingTotal = opsTotal;
+  const bookingActive = Number(k.notBooked ?? 0);
+  const bookingProgress = Number(k.bookingProgress ?? 0);
+  const bookingFresh = Number(k.fresh ?? 0);
+  const bookingCompleted = Number(k.stageCompleted ?? 0);
+  const bookingSla = Number(k.slaAlerts ?? 0);
+  const bookingPendingAml = Number(k.pendingAml ?? 0);
+  const amlTotal = Number(k.amlSentTotal ?? 0);
   const bookingPastAml = Math.max(0, bookingProgress - bookingPendingAml);
+
+  const amlBreakdown = {
+    total: amlTotal,
+    pending: Number(k.amlPending ?? 0),
+    partial: Number(k.amlPartial ?? 0),
+    approved: Number(k.amlApproved ?? 0),
+    rejected: Number(k.amlRejected ?? 0),
+  };
+
+  const bookingBreakdown = {
+    fresh: bookingFresh,
+    inAmlStages: bookingPendingAml,
+    inProgress: Number(k.bookingInProgress ?? 0),
+    fullyBooked: Number(k.opsBooked ?? bookedCount),
+    completed: bookingCompleted,
+  };
 
   const deptChart = [
     { name: "BRM", count: openPipeline, premium: pipelinePremium },
@@ -480,9 +571,11 @@ async function buildExecutive(req) {
         value: bookingPendingAml,
       },
       metrics: [
-        { label: "AML panel queue", count: amlQueue },
-        { label: "Pending AML (ops)", count: bookingPendingAml },
-        { label: "Needs review", count: amlTotal },
+        { label: "AML sent", count: amlTotal },
+        { label: "Pending", count: amlBreakdown.pending },
+        { label: "Partial", count: amlBreakdown.partial },
+        { label: "Approved", count: amlBreakdown.approved },
+        { label: "Rejected", count: amlBreakdown.rejected },
       ],
       pending: [
         { label: "Needs review", count: amlTotal },
@@ -514,13 +607,7 @@ async function buildExecutive(req) {
     status: d.status,
   }));
 
-  let dbOk = false;
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    dbOk = true;
-  } catch {
-    dbOk = false;
-  }
+  let dbOk = Boolean(opsKpis);
   const systemStatus = [
     {
       system: "PostgreSQL Database",
@@ -530,8 +617,8 @@ async function buildExecutive(req) {
     },
     {
       system: "Operations API",
-      status: opsInsights?.available ? "operational" : "unreachable",
-      uptime: opsInsights?.available ? "live" : "—",
+      status: opsLive?.available ? "operational" : "db-backed",
+      uptime: opsLive?.available ? "live" : "database",
       lastUpdate: new Date(),
     },
     {
@@ -542,15 +629,17 @@ async function buildExecutive(req) {
     },
   ];
 
-  const lostReasons = Array.isArray(lostMix?.items)
-    ? lostMix.items
-    : Array.isArray(lostMix)
-      ? lostMix
-      : Array.isArray(lostMix?.reasons)
-        ? lostMix.reasons
-        : [];
+  const lostReasons = Array.isArray(lostMix?.mix)
+    ? lostMix.mix
+    : Array.isArray(lostMix?.items)
+      ? lostMix.items
+      : Array.isArray(lostMix)
+        ? lostMix
+        : Array.isArray(lostMix?.reasons)
+          ? lostMix.reasons
+          : [];
 
-  return {
+  const payload = {
     heroes: {
       // Legacy fields kept for any older UI consumers
       brmAchieved: wonPremium,
@@ -587,7 +676,7 @@ async function buildExecutive(req) {
     deptChart,
     lostReasons: lostReasons.slice(0, 8),
     topBrokers: Array.isArray(brmSnap?.byExecutive)
-      ? brmSnap.byExecutive.slice(0, 5).map((e) => ({
+      ? brmSnap.byExecutive.slice(0, 15).map((e) => ({
           name: e.executiveName || e.executiveEmail || "—",
           cases: Number(e.totalCases || 0),
           premium: Number(e.totalGrossPremium || 0),
@@ -597,8 +686,7 @@ async function buildExecutive(req) {
     ops: {
       booking,
       aml,
-      available: Boolean(opsInsights?.available),
-      // Canonical counts — AML is NEVER added into Operations
+      available: Boolean(opsKpis || opsLive?.available),
       totals: {
         operations: opsTotal,
         booking: bookingTotal,
@@ -610,7 +698,12 @@ async function buildExecutive(req) {
         completed: bookingCompleted,
         slaAlerts: bookingSla,
       },
+      amlBreakdown,
+      bookingBreakdown,
     },
+    amlBreakdown,
+    bookingBreakdown,
+    datePolicy: DATE_POLICY_META,
     deptMixChart,
     opsBreakdown: [
       { name: "Operations (unique)", value: opsTotal, fill: "#0a2f6b" },
@@ -687,6 +780,11 @@ async function buildExecutive(req) {
     cards: medSnap?.cards || null,
     brmCards: c,
   };
+
+  // Only cache successful live payloads (never blank/failed KPI shells)
+  const liveOk = Boolean(opsKpis) && Boolean(brmSnap?.cards);
+  if (liveOk) executiveCache.set(dateFrom, dateTo, payload);
+  return payload;
 }
 
 router.get("/system-status", async (_req, res) => {

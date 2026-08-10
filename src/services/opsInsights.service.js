@@ -4,6 +4,7 @@
  * Ops universe = Status=3 unique cases (AML stages are a subset, never added on top).
  */
 const { prisma } = require("../lib/prisma");
+const { policyStartConds, amlSentToSql } = require("./managementDatePolicy");
 
 function toNum(v) {
   const n = Number(v);
@@ -27,16 +28,7 @@ const BASE = `
 `;
 
 function dateConds(dateFrom, dateTo, params) {
-  const out = [];
-  if (dateFrom) {
-    params.push(dateFrom);
-    out.push(`qc."CreateDate"::date >= $${params.length}::date`);
-  }
-  if (dateTo) {
-    params.push(dateTo);
-    out.push(`qc."CreateDate"::date <= $${params.length}::date`);
-  }
-  return out;
+  return policyStartConds("qc", dateFrom, dateTo, params);
 }
 
 function modeWhere(mode) {
@@ -50,7 +42,7 @@ function modeWhere(mode) {
   } else if (mode === "booking-completed") {
     w += ` AND COALESCE(qc."BookingStatus", false) = true`;
   } else if (mode === "aml") {
-    w += ` AND qc."CaseProgressStatus" >= 1 AND qc."CaseProgressStatus" <= 4`;
+    w += ` AND (${amlSentToSql("qc")})`;
   } else if (mode === "aml-cleared") {
     w += ` AND qc."CaseProgressStatus" >= 5`;
   } else if (mode === "operations-active") {
@@ -61,7 +53,8 @@ function modeWhere(mode) {
 }
 
 /**
- * Fast KPI path — no Company / CRM joins. Distinct latest version + CPS net.
+ * Fast Ops / Booking / AML KPIs — live Status=3 cases, PolicyEffectiveDate filter.
+ * AML sent-to resolved via one document CTE (not correlated EXISTS per aggregate).
  */
 async function getDeptKpis({ dateFrom, dateTo } = {}) {
   const params = [];
@@ -72,8 +65,10 @@ async function getDeptKpis({ dateFrom, dateTo } = {}) {
     WITH scoped AS (
       SELECT
         qc."ID",
+        qc."DisplayID",
         qc."BookingStatus",
         qc."CaseProgressStatus",
+        qc."CaseStatusByAmlDin",
         qc."CreateDate",
         REGEXP_REPLACE(COALESCE(qc."DisplayID", qc."ID"::text), '-V[0-9]+$', '') AS base_id,
         CAST(
@@ -85,16 +80,40 @@ async function getDeptKpis({ dateFrom, dateTo } = {}) {
     ),
     latest AS (
       SELECT DISTINCT ON (base_id)
-        s."ID", s."BookingStatus", s."CaseProgressStatus", s."CreateDate"
+        s."ID", s."DisplayID", s."BookingStatus", s."CaseProgressStatus", s."CaseStatusByAmlDin", s."CreateDate"
       FROM scoped s
       ORDER BY base_id, version_num DESC NULLS LAST, s."ID" DESC
+    ),
+    aml_case_ids AS (
+      SELECT DISTINCT d."HealthInsuranceQuotationCaseID" AS case_id
+      FROM public."HealthInsuranceQuotationDocument" d
+      WHERE d."HealthInsuranceQuotationCaseID" IS NOT NULL
+        AND COALESCE(d."IsArchived", false) = false
+        AND COALESCE(d."SentToAML", false) = true
+        AND (
+          LOWER(COALESCE(d."DocumentScope"::text, '')) = 'kyc'
+          OR LOWER(COALESCE(d."DocumentScope"::text, '')) LIKE '%kyc%'
+        )
+      UNION
+      SELECT DISTINCT l."ID" AS case_id
+      FROM latest l
+      INNER JOIN public."HealthInsuranceQuotationDocument" d
+        ON d."DisplayID" = l."DisplayID"
+      WHERE COALESCE(d."IsArchived", false) = false
+        AND COALESCE(d."SentToAML", false) = true
+        AND (
+          LOWER(COALESCE(d."DocumentScope"::text, '')) = 'kyc'
+          OR LOWER(COALESCE(d."DocumentScope"::text, '')) LIKE '%kyc%'
+        )
     ),
     priced AS (
       SELECT
         l.*,
-        COALESCE(NULLIF(cps."NetPremium"::float, 0), 0)::float AS net_premium
+        COALESCE(NULLIF(cps."NetPremium"::float, 0), 0)::float AS net_premium,
+        (a.case_id IS NOT NULL) AS aml_sent
       FROM latest l
       LEFT JOIN public."CasePremiumSummary" cps ON cps."CaseID" = l."ID"
+      LEFT JOIN aml_case_ids a ON a.case_id = l."ID"
     )
     SELECT
       COUNT(*)::int AS total,
@@ -108,6 +127,16 @@ async function getDeptKpis({ dateFrom, dateTo } = {}) {
         WHERE "CaseProgressStatus" = 0
           AND "CreateDate" <= NOW() - INTERVAL '7 days'
       )::int AS sla_alerts,
+      COUNT(*) FILTER (WHERE aml_sent)::int AS aml_sent_total,
+      COUNT(*) FILTER (WHERE aml_sent AND COALESCE("CaseStatusByAmlDin", 0) = 0)::int AS aml_pending,
+      COUNT(*) FILTER (WHERE aml_sent AND COALESCE("CaseStatusByAmlDin", 0) = 1)::int AS aml_approved,
+      COUNT(*) FILTER (WHERE aml_sent AND COALESCE("CaseStatusByAmlDin", 0) = 2)::int AS aml_partial,
+      COUNT(*) FILTER (WHERE aml_sent AND COALESCE("CaseStatusByAmlDin", 0) = 3)::int AS aml_rejected,
+      COUNT(*) FILTER (
+        WHERE COALESCE("BookingStatus", false) = false
+          AND "CaseProgressStatus" >= 5
+          AND "CaseProgressStatus" < 12
+      )::int AS booking_in_progress,
       COALESCE(SUM(net_premium), 0)::float AS total_premium,
       COALESCE(SUM(net_premium) FILTER (WHERE COALESCE("BookingStatus", false) = true), 0)::float AS booked_premium,
       COALESCE(SUM(net_premium) FILTER (WHERE "CaseProgressStatus" >= 1 AND "CaseProgressStatus" <= 4), 0)::float AS aml_premium,
@@ -127,6 +156,12 @@ async function getDeptKpis({ dateFrom, dateTo } = {}) {
       bookingProgress: toNum(r.booking_progress),
       stageCompleted: toNum(r.stage_completed),
       slaAlerts: toNum(r.sla_alerts),
+      amlSentTotal: toNum(r.aml_sent_total),
+      amlPending: toNum(r.aml_pending),
+      amlApproved: toNum(r.aml_approved),
+      amlPartial: toNum(r.aml_partial),
+      amlRejected: toNum(r.aml_rejected),
+      bookingInProgress: toNum(r.booking_in_progress),
       totalPremium: toNum(r.total_premium),
       bookedPremium: toNum(r.booked_premium),
       amlPremium: toNum(r.aml_premium),
@@ -143,6 +178,12 @@ async function getDeptKpis({ dateFrom, dateTo } = {}) {
       bookingProgress: 0,
       stageCompleted: 0,
       slaAlerts: 0,
+      amlSentTotal: 0,
+      amlPending: 0,
+      amlApproved: 0,
+      amlPartial: 0,
+      amlRejected: 0,
+      bookingInProgress: 0,
       totalPremium: 0,
       bookedPremium: 0,
       amlPremium: 0,
@@ -174,6 +215,7 @@ async function listCases({
   dateTo,
   booked, // all | yes | no
   stage, // fresh | aml | booking | completed | all
+  amlStatus, // pending | partial | approved | rejected
 } = {}) {
   const p = Math.max(1, parseInt(page, 10) || 1);
   const lim = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
@@ -189,6 +231,16 @@ async function listCases({
   else if (stage === "aml") extras.push(`qc."CaseProgressStatus" BETWEEN 1 AND 4`);
   else if (stage === "booking") extras.push(`qc."CaseProgressStatus" BETWEEN 5 AND 11`);
   else if (stage === "completed") extras.push(`qc."CaseProgressStatus" = 12`);
+
+  if (amlStatus === "pending") {
+    extras.push(`(${amlSentToSql("qc")}) AND COALESCE(qc."CaseStatusByAmlDin", 0) = 0`);
+  } else if (amlStatus === "partial") {
+    extras.push(`(${amlSentToSql("qc")}) AND COALESCE(qc."CaseStatusByAmlDin", 0) = 2`);
+  } else if (amlStatus === "approved") {
+    extras.push(`(${amlSentToSql("qc")}) AND COALESCE(qc."CaseStatusByAmlDin", 0) = 1`);
+  } else if (amlStatus === "rejected") {
+    extras.push(`(${amlSentToSql("qc")}) AND COALESCE(qc."CaseStatusByAmlDin", 0) = 3`);
+  }
 
   if (search && String(search).trim()) {
     params.push(`%${String(search).trim()}%`);
@@ -212,6 +264,7 @@ async function listCases({
         qc."Status",
         qc."BookingStatus",
         qc."CaseProgressStatus",
+        qc."CaseStatusByAmlDin",
         qc."CreateDate",
         qc."LastUpdateDate",
         qc."AssignedBrmExecutive",
@@ -258,6 +311,7 @@ async function listCases({
         qc."Status",
         qc."BookingStatus",
         qc."CaseProgressStatus",
+        qc."CaseStatusByAmlDin",
         qc."CreateDate",
         qc."LastUpdateDate",
         qc."AssignedBrmExecutive",

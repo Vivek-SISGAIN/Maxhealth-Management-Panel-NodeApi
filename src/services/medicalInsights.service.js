@@ -364,8 +364,84 @@ async function getOverviewSnapshot({
   };
 }
 
+async function getExecutiveCounts({ dateFrom, dateTo } = {}) {
+  const params = [];
+  let caseDateSql = "";
+  if (dateFrom) {
+    params.push(new Date(dateFrom));
+    caseDateSql += ` AND "CreatedAt" >= $${params.length}`;
+  }
+  if (dateTo) {
+    const to = new Date(dateTo);
+    to.setHours(23, 59, 59, 999);
+    params.push(to);
+    caseDateSql += ` AND "CreatedAt" <= $${params.length}`;
+  }
+
+  try {
+    const [caseRows, taskRows] = await Promise.all([
+      prisma.$queryRawUnsafe(
+        `
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE "Status" = 'NEW')::int AS new_cases,
+          COUNT(*) FILTER (WHERE "Status" = 'IN_REVIEW')::int AS in_review,
+          COUNT(*) FILTER (WHERE "Status" = 'COMPLETED')::int AS completed
+        FROM "UnderwritingCase"
+        WHERE 1=1 ${caseDateSql}
+        `,
+        ...params,
+      ),
+      prisma.$queryRawUnsafe(`
+        SELECT
+          COUNT(*)::int AS uw_tasks,
+          COUNT(*) FILTER (WHERE "SlaBreach" = true)::int AS sla_breached,
+          COUNT(*) FILTER (WHERE "Status" = 'PENDING')::int AS pending,
+          COUNT(*) FILTER (WHERE "Status" = 'IN_PROGRESS')::int AS in_progress
+        FROM "MedicalTask"
+        WHERE "TaskType" = 'UNDERWRITING'
+      `),
+    ]);
+    const c = caseRows?.[0] || {};
+    const t = taskRows?.[0] || {};
+    const totalCases = Number(c.total || 0);
+    const newCases = Number(c.new_cases || 0);
+    const inReview = Number(c.in_review || 0);
+    const completed = Number(c.completed || 0);
+    return {
+      cards: {
+        totalCases,
+        newCases,
+        inReview,
+        completed,
+        slaBreached: Number(t.sla_breached || 0),
+        uwTasks: Number(t.uw_tasks || 0),
+        tasksPending: Number(t.pending || 0),
+        tasksInProgress: Number(t.in_progress || 0),
+        byStatus: { new: newCases, inReview, completed },
+      },
+    };
+  } catch (e) {
+    console.warn("[medical] getExecutiveCounts failed:", e?.message || e);
+    return {
+      cards: {
+        totalCases: 0,
+        newCases: 0,
+        inReview: 0,
+        completed: 0,
+        slaBreached: 0,
+        uwTasks: 0,
+        tasksPending: 0,
+        tasksInProgress: 0,
+        byStatus: { new: 0, inReview: 0, completed: 0 },
+      },
+    };
+  }
+}
+
 module.exports = {
   getOverviewSnapshot,
+  getExecutiveCounts,
   getFilterOptions,
   getDoctorLoad,
   daysBetween,

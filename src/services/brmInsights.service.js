@@ -4,6 +4,10 @@
  */
 const { prisma } = require("../lib/prisma");
 const Redis = require("ioredis");
+const {
+  RENEWAL_MASTER_DATA_LATERAL,
+  renewalExpiryConds,
+} = require("./managementDatePolicy");
 
 const redis = process.env.REDIS_URL
   ? new Redis(process.env.REDIS_URL)
@@ -808,11 +812,11 @@ async function getCases({
 
   if (dates.dateFrom) {
     params.push(dates.dateFrom);
-    extra.push(`qc."CreateDate"::date >= $${params.length}::date`);
+    extra.push(`qc."PolicyEffectiveDate"::date >= $${params.length}::date`);
   }
   if (dates.dateTo) {
     params.push(dates.dateTo);
-    extra.push(`qc."CreateDate"::date <= $${params.length}::date`);
+    extra.push(`qc."PolicyEffectiveDate"::date <= $${params.length}::date`);
   }
   if (dealStatus != null && dealStatus !== "" && dealStatus !== "all") {
     params.push(parseInt(dealStatus, 10));
@@ -987,11 +991,11 @@ async function getCases({
   ];
   if (dates.dateFrom) {
     params.push(dates.dateFrom);
-    allExtra.push(`qc."CreateDate"::date >= $${params.length}::date`);
+    allExtra.push(`qc."PolicyEffectiveDate"::date >= $${params.length}::date`);
   }
   if (dates.dateTo) {
     params.push(dates.dateTo);
-    allExtra.push(`qc."CreateDate"::date <= $${params.length}::date`);
+    allExtra.push(`qc."PolicyEffectiveDate"::date <= $${params.length}::date`);
   }
   if (dealStatus != null && dealStatus !== "" && dealStatus !== "all") {
     params.push(parseInt(dealStatus, 10));
@@ -1189,17 +1193,16 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
   const params = [...names];
   let openExtra = "";
   let bookedExtra = "";
-  // Renewals: do NOT date-filter by EffectiveDate — Distributed portfolio is assign-based
-  // (same as BRM my_renewal). Month filters apply to NB CreateDate only.
+  // NB legs filter by policy start date (PolicyEffectiveDate).
   if (dates.dateFrom) {
     params.push(dates.dateFrom);
-    openExtra += ` AND qc."CreateDate"::date >= $${params.length}::date`;
-    bookedExtra += ` AND qc."CreateDate"::date >= $${params.length}::date`;
+    openExtra += ` AND qc."PolicyEffectiveDate"::date >= $${params.length}::date`;
+    bookedExtra += ` AND qc."PolicyEffectiveDate"::date >= $${params.length}::date`;
   }
   if (dates.dateTo) {
     params.push(dates.dateTo);
-    openExtra += ` AND qc."CreateDate"::date <= $${params.length}::date`;
-    bookedExtra += ` AND qc."CreateDate"::date <= $${params.length}::date`;
+    openExtra += ` AND qc."PolicyEffectiveDate"::date <= $${params.length}::date`;
+    bookedExtra += ` AND qc."PolicyEffectiveDate"::date <= $${params.length}::date`;
   }
   if (dealStatus != null && dealStatus !== "" && dealStatus !== "all") {
     params.push(parseInt(dealStatus, 10));
@@ -1397,7 +1400,7 @@ async function getByExecutive({ dateFrom, dateTo, dealStatus } = {}) {
 
 
 async function getTrends({ period = "monthly", executiveId, dateFrom, dateTo } = {}) {
-  const clamped = clampDateSpan({ dateFrom, dateTo }, 366);
+  const clamped = clampDateSpan({ dateFrom, dateTo }, 1096);
   const dates = withDefaultDates(clamped);
   const trunc = period === "yearly" ? "year" : "month";
   const fmt = period === "yearly" ? "'YYYY'" : "'YYYY-MM'";
@@ -1410,17 +1413,17 @@ async function getTrends({ period = "monthly", executiveId, dateFrom, dateTo } =
   const nbSql = hasExec
     ? `
       WITH ${brokerUsersCteSql("$1")}
-      SELECT TO_CHAR(date_trunc('${trunc}', qc."CreateDate"), ${fmt}) AS period,
+      SELECT TO_CHAR(date_trunc('${trunc}', qc."PolicyEffectiveDate"), ${fmt}) AS period,
              COUNT(*)::int AS "caseCount",
              COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float AS premium,
              COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float AS "nbBookedPremium",
              0::float AS "renBookedPremium"
       FROM public."HealthInsuranceQuotationCase" qc
       WHERE ${MASTER_DATA_CASE_FILTER}
-        AND qc."CreateDate"::date BETWEEN $2::date AND $3::date
+        AND qc."PolicyEffectiveDate"::date BETWEEN $2::date AND $3::date
       GROUP BY 1 ORDER BY 1 ASC`
     : `
-      SELECT TO_CHAR(date_trunc('${trunc}', qc."CreateDate"), ${fmt}) AS period,
+      SELECT TO_CHAR(date_trunc('${trunc}', qc."PolicyEffectiveDate"), ${fmt}) AS period,
              COUNT(*)::int AS "caseCount",
              COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float AS premium,
              COALESCE(SUM(COALESCE(qc."TargetPremium", 0)), 0)::float AS "nbBookedPremium",
@@ -1428,38 +1431,68 @@ async function getTrends({ period = "monthly", executiveId, dateFrom, dateTo } =
       FROM public."HealthInsuranceQuotationCase" qc
       WHERE qc."DisplayID" ~ '-[BI][0-9]+'
         AND qc."BookingStatus" IS false
-        AND qc."CreateDate"::date BETWEEN $1::date AND $2::date
+        AND qc."PolicyEffectiveDate"::date BETWEEN $1::date AND $2::date
       GROUP BY 1 ORDER BY 1 ASC`;
 
   const renParams = hasExec
     ? [executiveId, dates.dateFrom, dates.dateTo]
     : [dates.dateFrom, dates.dateTo];
+  // Fast renewal trends — PolicyExpiryDate via hash-join (not per-batch lateral)
   const renSql = hasExec
     ? `
-      SELECT TO_CHAR(date_trunc('${trunc}', b."EffectiveDate"), ${fmt}) AS period,
+      WITH expiry_by_pgc AS (
+        SELECT
+          TRIM(m."PolicyGroupCode"::text) AS pgc,
+          MAX(m."PolicyExpiryDate") FILTER (
+            WHERE m."PolicyExpiryDate" IS NOT NULL
+              AND m."PolicyExpiryDate" != 'infinity'::date
+          ) AS expiry_date
+        FROM public."MasterDataLayer" m
+        WHERE NULLIF(TRIM(COALESCE(m."PolicyGroupCode"::text, '')), '') IS NOT NULL
+          AND TRIM(COALESCE(m."EndorsementTypeCode"::text, '')) IN ('02', '2')
+        GROUP BY 1
+      )
+      SELECT TO_CHAR(date_trunc('${trunc}', mp.expiry_date), ${fmt}) AS period,
              COUNT(*)::int AS "batchCount",
              COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "expiringPremium",
              0::float AS "nbBookedPremium",
              COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "renBookedPremium"
       FROM public."BrmRenewalData" b
+      LEFT JOIN expiry_by_pgc mp ON mp.pgc = TRIM(COALESCE(b."PolicyGroupCode"::text, ''))
       WHERE b."BatchStatus" = 'Distributed'
         AND $1::text = ANY(b."BrmUserIds")
-        AND b."EffectiveDate"::date BETWEEN $2::date AND $3::date
+        AND mp.expiry_date::date BETWEEN $2::date AND $3::date
       GROUP BY 1 ORDER BY 1 ASC`
     : `
-      SELECT TO_CHAR(date_trunc('${trunc}', b."EffectiveDate"), ${fmt}) AS period,
+      WITH expiry_by_pgc AS (
+        SELECT
+          TRIM(m."PolicyGroupCode"::text) AS pgc,
+          MAX(m."PolicyExpiryDate") FILTER (
+            WHERE m."PolicyExpiryDate" IS NOT NULL
+              AND m."PolicyExpiryDate" != 'infinity'::date
+          ) AS expiry_date
+        FROM public."MasterDataLayer" m
+        WHERE NULLIF(TRIM(COALESCE(m."PolicyGroupCode"::text, '')), '') IS NOT NULL
+          AND TRIM(COALESCE(m."EndorsementTypeCode"::text, '')) IN ('02', '2')
+        GROUP BY 1
+      )
+      SELECT TO_CHAR(date_trunc('${trunc}', mp.expiry_date), ${fmt}) AS period,
              COUNT(*)::int AS "batchCount",
              COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "expiringPremium",
              0::float AS "nbBookedPremium",
              COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "renBookedPremium"
       FROM public."BrmRenewalData" b
+      LEFT JOIN expiry_by_pgc mp ON mp.pgc = TRIM(COALESCE(b."PolicyGroupCode"::text, ''))
       WHERE b."BatchStatus" = 'Distributed'
-        AND b."EffectiveDate"::date BETWEEN $1::date AND $2::date
+        AND mp.expiry_date::date BETWEEN $1::date AND $2::date
       GROUP BY 1 ORDER BY 1 ASC`;
 
   const [nbRows, renRows] = await Promise.all([
     query(nbSql, caseParams),
-    query(renSql, renParams),
+    query(renSql, renParams).catch((e) => {
+      console.warn("[brm] getTrends renewal skipped:", e?.message || e);
+      return [];
+    }),
   ]);
 
   const periodMap = new Map();
@@ -1503,6 +1536,8 @@ async function getRenewals({
   search,
   policyType = "Group",
   executiveId,
+  dateFrom,
+  dateTo,
   limit = 25,
   offset = 0,
 } = {}) {
@@ -1528,6 +1563,11 @@ async function getRenewals({
       OR b."PolicyGroupCode" ILIKE $${params.length}
       OR b."BatchName" ILIKE $${params.length}
     )`;
+  }
+
+  const expiryConds = renewalExpiryConds(dateFrom, dateTo, params);
+  if (expiryConds.length) {
+    where += ` AND ${expiryConds.join(" AND ")}`;
   }
 
   const filterParams = [...params];
@@ -1597,9 +1637,18 @@ async function getRenewals({
        LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
       params,
     ),
-    query(`SELECT COUNT(*)::int AS count FROM public."BrmRenewalData" b ${where}`, filterParams),
     query(
-      `SELECT COUNT(*)::int AS count FROM public."BrmRenewalData" b ${where} AND b."BrmActionStatus" = 2`,
+      `SELECT COUNT(*)::int AS count
+       FROM public."BrmRenewalData" b
+       ${RENEWAL_MASTER_DATA_LATERAL}
+       ${where}`,
+      filterParams,
+    ),
+    query(
+      `SELECT COUNT(*)::int AS count
+       FROM public."BrmRenewalData" b
+       ${RENEWAL_MASTER_DATA_LATERAL}
+       ${where} AND b."BrmActionStatus" = 2`,
       filterParams,
     ),
     query(
@@ -1680,13 +1729,149 @@ async function getCompare({
  * Dates optional when filtering a BRM (parity); defaults only for global trend chart.
  * Supports dealStatus + period for the new Management Overview UI.
  */
-async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, period = "monthly" } = {}) {
+/**
+ * Top BRMs for executive — real AspNet BRM/Admin users only (no "unassigned" dump).
+ * Matches AssignedBrmExecutive by user Id / email / username, plus self-created cases.
+ */
+async function getTopExecutivesLite({ dateFrom, dateTo, limit = 15 } = {}) {
+  const dates = optionalDates({ dateFrom, dateTo });
+  const names = BRM_ROLE_NAMES;
+  const params = [...names];
+  const dateConds = [
+    `qc."DisplayID" ~ '-[BD][0-9]+'`,
+    `qc."BookingStatus" IS false`,
+  ];
+  if (dates.dateFrom) {
+    params.push(dates.dateFrom);
+    dateConds.push(`qc."PolicyEffectiveDate"::date >= $${params.length}::date`);
+  }
+  if (dates.dateTo) {
+    params.push(dates.dateTo);
+    dateConds.push(`qc."PolicyEffectiveDate"::date <= $${params.length}::date`);
+  }
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 15, 1), 40);
+  params.push(lim);
+  const rolePlaceholders = names.map((_, i) => `UPPER($${i + 1})`).join(", ");
+
+  const rows = await query(
+    `
+    WITH brm_users AS (
+      SELECT DISTINCT ON (an."Id")
+        an."Id",
+        COALESCE(
+          NULLIF(TRIM(an."UserName"), ''),
+          NULLIF(TRIM(an."Email"), ''),
+          an."Id"
+        ) AS "executiveName",
+        LOWER(TRIM(COALESCE(an."Email", ''))) AS email_l,
+        LOWER(TRIM(COALESCE(an."UserName", ''))) AS name_l
+      FROM public."AspNetUserRoles" aur
+      JOIN public."AspNetUsers" an ON an."Id" = aur."UserId"
+      JOIN public."AspNetRoles" r ON r."Id" = aur."RoleId"
+      WHERE UPPER(TRIM(r."Name")) IN (${rolePlaceholders})
+      ORDER BY an."Id", r."Name"
+    ),
+    scoped AS (
+      SELECT
+        qc."ID",
+        qc."DisplayID",
+        qc."TargetPremium",
+        qc."AssignedBrmExecutive",
+        qc."CreatedByUserID",
+        REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', '') AS base_display_id,
+        CAST(
+          NULLIF(REGEXP_REPLACE(qc."DisplayID", '^.*-V([0-9]+)$', '\\1'), qc."DisplayID")
+          AS INT
+        ) AS version_num
+      FROM public."HealthInsuranceQuotationCase" qc
+      WHERE ${dateConds.join(" AND ")}
+    ),
+    latest AS (
+      SELECT DISTINCT ON (base_display_id)
+        "ID",
+        "AssignedBrmExecutive",
+        "CreatedByUserID",
+        COALESCE("TargetPremium", 0)::float AS target_premium
+      FROM scoped
+      ORDER BY base_display_id, version_num DESC NULLS LAST, "ID" DESC
+    ),
+    tokens AS (
+      SELECT
+        l."ID",
+        l.target_premium,
+        l."CreatedByUserID",
+        LOWER(TRIM(tok)) AS token
+      FROM latest l
+      CROSS JOIN LATERAL unnest(
+        string_to_array(REPLACE(COALESCE(l."AssignedBrmExecutive"::text, ''), ' ', ''), ',')
+      ) AS tok
+      WHERE NULLIF(TRIM(tok), '') IS NOT NULL
+    ),
+    matched AS (
+      SELECT DISTINCT
+        bu."Id" AS executive_id,
+        bu."executiveName",
+        l."ID" AS case_id,
+        l.target_premium
+      FROM latest l
+      JOIN brm_users bu ON (
+        EXISTS (
+          SELECT 1 FROM public."User" creator
+          WHERE creator."ID" = l."CreatedByUserID"
+            AND creator."AspNetUserID"::text = bu."Id"::text
+        )
+        OR EXISTS (
+          SELECT 1 FROM tokens t
+          WHERE t."ID" = l."ID"
+            AND (
+              t.token = LOWER(bu."Id"::text)
+              OR (bu.email_l <> '' AND t.token = bu.email_l)
+              OR (bu.name_l <> '' AND t.token = bu.name_l)
+            )
+        )
+      )
+    ),
+    ranked AS (
+      SELECT
+        executive_id,
+        MAX("executiveName") AS "executiveName",
+        COUNT(*)::int AS "totalCases",
+        COALESCE(SUM(target_premium), 0)::float AS "totalGrossPremium"
+      FROM matched
+      GROUP BY executive_id
+      HAVING COUNT(*) > 0
+      ORDER BY "totalCases" DESC, "totalGrossPremium" DESC
+      LIMIT $${params.length}
+    )
+    SELECT
+      executive_id AS "executiveId",
+      "executiveName",
+      "totalCases",
+      "totalGrossPremium"
+    FROM ranked
+    ORDER BY "totalCases" DESC, "totalGrossPremium" DESC
+    `,
+    params,
+  );
+
+  return rows.map((r) => ({
+    executiveId: r.executiveId,
+    executiveName: r.executiveName,
+    executiveEmail: null,
+    totalCases: toNumber(r.totalCases),
+    totalGrossPremium: toNumber(r.totalGrossPremium),
+    brmTotal: toNumber(r.totalCases),
+    winRate: null,
+  }));
+}
+
+async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, period = "monthly", executiveLite = false } = {}) {
   // Only clamp when the client actually sent dates. Empty = All time (no fabricated window).
   const hasClientDates = Boolean(
     (dateFrom && String(dateFrom).trim()) || (dateTo && String(dateTo).trim()),
   );
   const clamped = hasClientDates
-    ? clampDateSpan({ dateFrom, dateTo }, 366)
+    ? clampDateSpan({ dateFrom, dateTo }, 1096)
     : { dateFrom: null, dateTo: null };
   const opt = optionalDates(clamped);
   const trendDates = withDefaultDates(hasClientDates ? clamped : {});
@@ -1696,7 +1881,8 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
   const dealVal = hasDeal ? parseInt(dealStatus, 10) : null;
 
   const cacheKey =
-    `mgmt:brm:overview:v3:` +
+    `mgmt:brm:overview:v4:` +
+    `${executiveLite ? "lite:" : ""}` +
     `${hasExec ? executiveId : "all"}:` +
     `${hasDeal ? dealStatus : "all"}:` +
     `${period}:` +
@@ -1718,11 +1904,11 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
     const dateConds = [];
     if (opt.dateFrom) {
       pipelineParams.push(opt.dateFrom);
-      dateConds.push(`qc."CreateDate"::date >= $${pipelineParams.length}::date`);
+      dateConds.push(`qc."PolicyEffectiveDate"::date >= $${pipelineParams.length}::date`);
     }
     if (opt.dateTo) {
       pipelineParams.push(opt.dateTo);
-      dateConds.push(`qc."CreateDate"::date <= $${pipelineParams.length}::date`);
+      dateConds.push(`qc."PolicyEffectiveDate"::date <= $${pipelineParams.length}::date`);
     }
     let dealParam = "";
     if (hasDeal) {
@@ -1769,11 +1955,11 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
     ];
     if (opt.dateFrom) {
       pipelineParams.push(opt.dateFrom);
-      dateConds.push(`qc."CreateDate"::date >= $${pipelineParams.length}::date`);
+      dateConds.push(`qc."PolicyEffectiveDate"::date >= $${pipelineParams.length}::date`);
     }
     if (opt.dateTo) {
       pipelineParams.push(opt.dateTo);
-      dateConds.push(`qc."CreateDate"::date <= $${pipelineParams.length}::date`);
+      dateConds.push(`qc."PolicyEffectiveDate"::date <= $${pipelineParams.length}::date`);
     }
     if (hasDeal) {
       pipelineParams.push(dealVal);
@@ -1820,55 +2006,118 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
   const bookedTo = opt.dateTo || trendDates.dateTo;
   const bookedParams = [bookedFrom, bookedTo];
 
-  // Renewals = BRM my_renewal parity (no EffectiveDate clamp — that zeroed the portfolio).
-  // All: Distributed + Draft-unassigned, Group only. One BRM: Distributed + assigned.
+  // Renewals: PolicyExpiryDate via one hash-join (not per-row lateral — was causing 60s+ timeouts)
   const renewalParams = hasExec ? [executiveId] : [];
-  const renewalWhere = hasExec
-    ? `WHERE ${renewalBatchScopeSql(false)} AND ${RENEWAL_GROUP_ONLY_SQL} AND $1::text = ANY(b."BrmUserIds")`
-    : `WHERE ${renewalBatchScopeSql(true)} AND ${RENEWAL_GROUP_ONLY_SQL}`;
+  const expiryConds = renewalExpiryConds(opt.dateFrom, opt.dateTo, renewalParams, "mp.expiry_date");
+  const expiryWhere = expiryConds.length ? `AND ${expiryConds.join(" AND ")}` : "";
+  const renewalScope = hasExec
+    ? `${renewalBatchScopeSql(false)} AND ${RENEWAL_GROUP_ONLY_SQL} AND $1::text = ANY(b."BrmUserIds")`
+    : `${renewalBatchScopeSql(true)} AND ${RENEWAL_GROUP_ONLY_SQL}`;
 
-  const [byExecutive, trends, pipeline, renewalRows, bookedRows] = await Promise.all([
-    getByExecutive({
-      dateFrom: opt.dateFrom || undefined,
-      dateTo: opt.dateTo || undefined,
-      dealStatus: hasDeal ? dealStatus : undefined,
-    }),
-    getTrends({
-      period: period === "yearly" ? "yearly" : "monthly",
-      executiveId,
-      dateFrom: trendDates.dateFrom,
-      dateTo: trendDates.dateTo,
-    }),
-    query(pipelineSql, pipelineParams),
-    query(
-      `SELECT COUNT(*)::int AS total,
-              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_HOT_SQL})::int AS hot,
-              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_ACTIVE_SQL})::int AS active,
-              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_WARM_SQL})::int AS warm,
-              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_COLD_SQL})::int AS cold,
-              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_ONGOING_SQL})::int AS ongoing,
-              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_WON_SQL})::int AS confirmed,
-              COUNT(*) FILTER (WHERE ${RENEWAL_EFF_LOST_SQL})::int AS lost,
-              COUNT(*) FILTER (WHERE ${RENEWAL_PENDING_SQL} AND b."LinkedQuotationCaseId" IS NULL)::int AS pending,
-              COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "totalExpiringPremium",
-              ${RENEWAL_WON_PREMIUM_SQL} AS "wonPremium"
-       FROM public."BrmRenewalData" b
-       ${RENEWAL_LINKED_JOIN}
-       ${renewalWhere}`,
-      renewalParams,
-    ),
-    query(
-      `SELECT COALESCE(SUM("GrossPremium"), 0)::float AS "bookedPremium",
-              COUNT(*)::int AS "bookedCount",
-              COUNT(DISTINCT "TechnicalSheetNumber")::int AS "bookedSheetCount"
-       FROM public."MasterDataLayer"
-       WHERE UPPER(TRIM("NewOrRenewal")) = 'NEW'
-         AND COALESCE("EventNbr"::int, 1) = 1
-         AND "PolicyEffectiveDate" >= $1::date
-         AND "PolicyEffectiveDate" <= $2::date`,
-      bookedParams,
-    ).catch(() => [{ bookedPremium: 0, bookedCount: 0, bookedSheetCount: 0 }]),
-  ]);
+  const renewalQuery = query(
+    `WITH expiry_by_pgc AS (
+       SELECT
+         TRIM(m."PolicyGroupCode"::text) AS pgc,
+         MAX(m."PolicyExpiryDate") FILTER (
+           WHERE m."PolicyExpiryDate" IS NOT NULL
+             AND m."PolicyExpiryDate" != 'infinity'::date
+         ) AS expiry_date
+       FROM public."MasterDataLayer" m
+       WHERE NULLIF(TRIM(COALESCE(m."PolicyGroupCode"::text, '')), '') IS NOT NULL
+         AND TRIM(COALESCE(m."EndorsementTypeCode"::text, '')) IN ('02', '2')
+       GROUP BY 1
+     )
+     SELECT COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE ${RENEWAL_EFF_HOT_SQL})::int AS hot,
+            COUNT(*) FILTER (WHERE ${RENEWAL_EFF_ACTIVE_SQL})::int AS active,
+            COUNT(*) FILTER (WHERE ${RENEWAL_EFF_WARM_SQL})::int AS warm,
+            COUNT(*) FILTER (WHERE ${RENEWAL_EFF_COLD_SQL})::int AS cold,
+            COUNT(*) FILTER (WHERE ${RENEWAL_EFF_ONGOING_SQL})::int AS ongoing,
+            COUNT(*) FILTER (WHERE ${RENEWAL_EFF_WON_SQL})::int AS confirmed,
+            COUNT(*) FILTER (WHERE ${RENEWAL_EFF_LOST_SQL})::int AS lost,
+            COUNT(*) FILTER (WHERE ${RENEWAL_PENDING_SQL} AND b."LinkedQuotationCaseId" IS NULL)::int AS pending,
+            COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "totalExpiringPremium",
+            ${RENEWAL_WON_PREMIUM_SQL} AS "wonPremium"
+     FROM public."BrmRenewalData" b
+     ${RENEWAL_LINKED_JOIN}
+     LEFT JOIN expiry_by_pgc mp ON mp.pgc = TRIM(COALESCE(b."PolicyGroupCode"::text, ''))
+     WHERE ${renewalScope}
+       ${expiryWhere}`,
+    renewalParams,
+  );
+
+  const trendsQuery = getTrends({
+    period: period === "yearly" ? "yearly" : "monthly",
+    executiveId,
+    dateFrom: trendDates.dateFrom,
+    dateTo: trendDates.dateTo,
+  });
+
+  const t0 = Date.now();
+  let byExecutive;
+  let trends;
+  let pipeline;
+  let renewalRows;
+  let bookedRows;
+
+  // Fast ranking for company-wide overview (full getByExecutive ownership join is too slow for gateway).
+  // Single-executive filter still uses getByExecutive for ownership parity.
+  if (!hasExec) {
+    [trends, pipeline, renewalRows, byExecutive, bookedRows] = await Promise.all([
+      trendsQuery.catch((e) => {
+        console.warn("[brm] overview trends skipped:", e?.message || e);
+        return { series: [] };
+      }),
+      query(pipelineSql, pipelineParams),
+      renewalQuery,
+      getTopExecutivesLite({
+        dateFrom: opt.dateFrom,
+        dateTo: opt.dateTo,
+        limit: 40,
+      }).catch(() => []),
+      query(
+        `SELECT COALESCE(SUM("GrossPremium"), 0)::float AS "bookedPremium",
+                COUNT(*)::int AS "bookedCount",
+                COUNT(DISTINCT "TechnicalSheetNumber")::int AS "bookedSheetCount"
+         FROM public."MasterDataLayer"
+         WHERE UPPER(TRIM("NewOrRenewal")) = 'NEW'
+           AND COALESCE("EventNbr"::int, 1) = 1
+           AND "PolicyEffectiveDate" >= $1::date
+           AND "PolicyEffectiveDate" <= $2::date`,
+        bookedParams,
+      ).catch(() => [{ bookedPremium: 0, bookedCount: 0, bookedSheetCount: 0 }]),
+    ]);
+    byExecutive = { executives: byExecutive || [], totals: {} };
+  } else {
+    [byExecutive, trends, pipeline, renewalRows, bookedRows] = await Promise.all([
+      getByExecutive({
+        dateFrom: opt.dateFrom || undefined,
+        dateTo: opt.dateTo || undefined,
+        dealStatus: hasDeal ? dealStatus : undefined,
+      }),
+      trendsQuery.catch((e) => {
+        console.warn("[brm] overview trends skipped:", e?.message || e);
+        return { series: [] };
+      }),
+      query(pipelineSql, pipelineParams),
+      renewalQuery,
+      query(
+        `SELECT COALESCE(SUM("GrossPremium"), 0)::float AS "bookedPremium",
+                COUNT(*)::int AS "bookedCount",
+                COUNT(DISTINCT "TechnicalSheetNumber")::int AS "bookedSheetCount"
+         FROM public."MasterDataLayer"
+         WHERE UPPER(TRIM("NewOrRenewal")) = 'NEW'
+           AND COALESCE("EventNbr"::int, 1) = 1
+           AND "PolicyEffectiveDate" >= $1::date
+           AND "PolicyEffectiveDate" <= $2::date`,
+        bookedParams,
+      ).catch(() => [{ bookedPremium: 0, bookedCount: 0, bookedSheetCount: 0 }]),
+    ]);
+  }
+  console.log(
+    `[brm] getOverviewSnapshot ${Date.now() - t0}ms ` +
+      `exec=${hasExec ? executiveId : "all"} range=${opt.dateFrom || "all"}->${opt.dateTo || "all"}`,
+  );
 
   const p = pipeline[0] || {};
   const renewalSnap = renewalRows[0] || {};
@@ -2014,7 +2263,7 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
       lostCases: byExecutive.executives.reduce((s, e) => s + toNumber(e.lostCases), 0),
     },
     executiveCount: byExecutive.executives.length,
-    trends: trends.series,
+    trends: Array.isArray(trends?.series) ? trends.series : [],
     caseKpis: {
       totalCount: toNumber(p.openCount),
       activeCount: toNumber(p.activeCount),
@@ -2078,10 +2327,7 @@ async function getLostReasonMix({ dateFrom, dateTo, brmName } = {}) {
           qc."AssignedBrmExecutive"
         FROM public."HealthInsuranceQuotationCase" qc
         WHERE COALESCE(qc."Status"::int, 0) = 4
-          AND (
-            qc."LastUpdateDate"::date BETWEEN $1::date AND $2::date
-            OR qc."CreateDate"::date BETWEEN $1::date AND $2::date
-          )
+          AND qc."PolicyEffectiveDate"::date BETWEEN $1::date AND $2::date
           ${assignFilter}
         ORDER BY REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', ''), qc."ID" DESC
       ) qc
@@ -2189,6 +2435,173 @@ async function getCaseMemberDrilldown(caseKey) {
   };
 }
 
+/**
+ * Fast executive BRM slice — live pipeline + renewals (PolicyExpiryDate).
+ * Renewal expiry uses one MasterDataLayer aggregate join (not per-row lateral).
+ * Skips heavy trends / full per-BRM ownership joins (those stay on BRM Overview page).
+ */
+async function getExecutiveSnapshot({ dateFrom, dateTo } = {}) {
+  const hasClientDates = Boolean(
+    (dateFrom && String(dateFrom).trim()) || (dateTo && String(dateTo).trim()),
+  );
+  const clamped = hasClientDates
+    ? clampDateSpan({ dateFrom, dateTo }, 1096)
+    : { dateFrom: null, dateTo: null };
+  const opt = optionalDates(clamped);
+
+  const cacheKey = `mgmt:brm:executive:v4:${opt.dateFrom || "all"}:${opt.dateTo || "all"}`;
+  if (redis) {
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch {
+      // ignore
+    }
+  }
+
+  const pipelineParams = [];
+  const dateConds = [
+    `qc."DisplayID" ~ '-[BD][0-9]+'`,
+    `qc."BookingStatus" IS false`,
+  ];
+  if (opt.dateFrom) {
+    pipelineParams.push(opt.dateFrom);
+    dateConds.push(`qc."PolicyEffectiveDate"::date >= $${pipelineParams.length}::date`);
+  }
+  if (opt.dateTo) {
+    pipelineParams.push(opt.dateTo);
+    dateConds.push(`qc."PolicyEffectiveDate"::date <= $${pipelineParams.length}::date`);
+  }
+
+  const pipelineSql = `
+    WITH scoped AS (
+      SELECT
+        qc."ID",
+        qc."DealStatus",
+        qc."Status",
+        qc."TargetPremium",
+        qc."DisplayID",
+        REGEXP_REPLACE(qc."DisplayID", '-V[0-9]+$', '') AS base_display_id,
+        CAST(NULLIF(REGEXP_REPLACE(qc."DisplayID", '^.*-V([0-9]+)$', '\\1'), qc."DisplayID") AS INT) AS version_num
+      FROM public."HealthInsuranceQuotationCase" qc
+      WHERE ${dateConds.join(" AND ")}
+    ),
+    latest AS (
+      SELECT DISTINCT ON (base_display_id)
+        "DealStatus", "Status", "TargetPremium"
+      FROM scoped
+      ORDER BY base_display_id, version_num DESC NULLS LAST
+    )
+    SELECT
+      COUNT(*)::int AS "openCount",
+      COUNT(*) FILTER (WHERE ${NB_HOT_SQL})::int AS "hotCount",
+      COUNT(*) FILTER (WHERE ${NB_ACTIVE_SQL})::int AS "activeCount",
+      COUNT(*) FILTER (WHERE ${NB_WARM_SQL})::int AS "warmCount",
+      COUNT(*) FILTER (WHERE ${NB_COLD_SQL})::int AS "coldCount",
+      COUNT(*) FILTER (WHERE ${NB_ONGOING_STATUS_SQL})::int AS "ongoingCount",
+      COUNT(*) FILTER (WHERE ${NB_WON_STATUS_SQL})::int AS "wonCount",
+      COUNT(*) FILTER (WHERE ${NB_LOST_STATUS_SQL})::int AS "lostCount",
+      COUNT(*)::int AS "totalCount",
+      COALESCE(SUM(COALESCE("TargetPremium", 0)), 0)::float AS "openPremium"
+    FROM latest
+  `;
+
+  const renewalParams = [];
+  const expiryConds = renewalExpiryConds(opt.dateFrom, opt.dateTo, renewalParams, "mp.expiry_date");
+  const expiryWhere = expiryConds.length ? `AND ${expiryConds.join(" AND ")}` : "";
+
+  // Hash-join expiry by PolicyGroupCode (group renewals) — same date field as Renewals panel.
+  const renewalSql = `
+    WITH expiry_by_pgc AS (
+      SELECT
+        TRIM(m."PolicyGroupCode"::text) AS pgc,
+        MAX(m."PolicyExpiryDate") FILTER (
+          WHERE m."PolicyExpiryDate" IS NOT NULL
+            AND m."PolicyExpiryDate" != 'infinity'::date
+        ) AS expiry_date
+      FROM public."MasterDataLayer" m
+      WHERE NULLIF(TRIM(COALESCE(m."PolicyGroupCode"::text, '')), '') IS NOT NULL
+        AND TRIM(COALESCE(m."EndorsementTypeCode"::text, '')) IN ('02', '2')
+      GROUP BY 1
+    )
+    SELECT COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE ${RENEWAL_EFF_HOT_SQL})::int AS hot,
+           COUNT(*) FILTER (WHERE ${RENEWAL_EFF_ACTIVE_SQL})::int AS active,
+           COUNT(*) FILTER (WHERE ${RENEWAL_EFF_WARM_SQL})::int AS warm,
+           COUNT(*) FILTER (WHERE ${RENEWAL_EFF_COLD_SQL})::int AS cold,
+           COUNT(*) FILTER (WHERE ${RENEWAL_EFF_ONGOING_SQL})::int AS ongoing,
+           COUNT(*) FILTER (WHERE ${RENEWAL_EFF_WON_SQL})::int AS confirmed,
+           COUNT(*) FILTER (WHERE ${RENEWAL_EFF_LOST_SQL})::int AS lost,
+           COUNT(*) FILTER (WHERE ${RENEWAL_PENDING_SQL} AND b."LinkedQuotationCaseId" IS NULL)::int AS pending,
+           COALESCE(SUM(COALESCE(NULLIF(b."ExpiringPremium"::float, 0), 0)), 0)::float AS "totalExpiringPremium",
+           ${RENEWAL_WON_PREMIUM_SQL} AS "wonPremium"
+    FROM public."BrmRenewalData" b
+    ${RENEWAL_LINKED_JOIN}
+    LEFT JOIN expiry_by_pgc mp
+      ON mp.pgc = TRIM(COALESCE(b."PolicyGroupCode"::text, ''))
+    WHERE ${renewalBatchScopeSql(true)}
+      AND ${RENEWAL_GROUP_ONLY_SQL}
+      ${expiryWhere}
+  `;
+
+  const t0 = Date.now();
+  const [pipeline, renewalRows, topExecs] = await Promise.all([
+    query(pipelineSql, pipelineParams),
+    query(renewalSql, renewalParams),
+    getTopExecutivesLite({ dateFrom: opt.dateFrom, dateTo: opt.dateTo, limit: 15 }).catch(() => []),
+  ]);
+  console.log(`[brm] getExecutiveSnapshot ${Date.now() - t0}ms range=${opt.dateFrom}->${opt.dateTo}`);
+
+  const p = pipeline[0] || {};
+  const r = renewalRows[0] || {};
+
+  const cards = {
+    openPipelineCount: toNumber(p.openCount),
+    openPremium: toNumber(p.openPremium),
+    nbHot: toNumber(p.hotCount),
+    nbActive: toNumber(p.activeCount),
+    nbWarm: toNumber(p.warmCount),
+    nbCold: toNumber(p.coldCount),
+    nbOngoing: toNumber(p.ongoingCount),
+    nbWon: toNumber(p.wonCount),
+    nbLost: toNumber(p.lostCount),
+    nbCount: toNumber(p.totalCount),
+    renCount: toNumber(r.total),
+    renHot: toNumber(r.hot),
+    renActive: toNumber(r.active),
+    renWarm: toNumber(r.warm),
+    renCold: toNumber(r.cold),
+    renOngoing: toNumber(r.ongoing),
+    renConfirmed: toNumber(r.confirmed),
+    renWon: toNumber(r.confirmed),
+    renLost: toNumber(r.lost),
+    renPending: toNumber(r.pending),
+    renExpiringPremium: toNumber(r.totalExpiringPremium),
+    renWonPremium: toNumber(r.wonPremium),
+    brmCount: Array.isArray(topExecs) ? topExecs.length : 0,
+    bookedPremium: 0,
+    bookedCount: 0,
+    winCasePremium: toNumber(r.wonPremium),
+  };
+
+  const out = {
+    cards,
+    byExecutive: topExecs || [],
+    byExecutiveFull: topExecs || [],
+    trends: [],
+  };
+
+  if (redis) {
+    try {
+      await redis.setex(cacheKey, 90, JSON.stringify(out));
+    } catch {
+      // ignore
+    }
+  }
+
+  return out;
+}
+
 module.exports = {
   getExecutives,
   getSummaryCards,
@@ -2199,6 +2612,7 @@ module.exports = {
   getRenewals,
   getCompare,
   getOverviewSnapshot,
+  getExecutiveSnapshot,
   getLostReasonMix,
   getCaseMemberDrilldown,
 };
