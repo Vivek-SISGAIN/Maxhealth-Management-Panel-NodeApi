@@ -1624,6 +1624,16 @@ async function getRenewals({
          b."RenewalTPA", b."RenewalBroker", b."RenewalDIN", b."RenewalMH"::float AS "RenewalMH",
          b."RunningLossRatio"::float AS "RunningLossRatio",
          b."FinalIncrease"::float AS "FinalIncrease",
+         b."SealedIncrease"::float AS "SealedIncrease",
+         b."BookedIncrease"::float AS "BookedIncrease",
+         b."MedicalLoading"::float AS "MedicalLoading",
+         b."Treaty",
+         b."RenewalTreaty",
+         CASE
+           WHEN COALESCE(lqc."BookingStatus", false) = true THEN 'Booked'
+           WHEN b."BatchStatus" = 'Distributed' THEN 'Sealed'
+           ELSE 'Draft'
+         END AS "pipelineStatus",
          b."BrmAction01"::text AS "BrmAction01",
          b."BrmActionStatus"::text AS "BrmActionStatus",
          b."BrmConfirmStatus"::text AS "BrmConfirmStatus",
@@ -1631,6 +1641,9 @@ async function getRenewals({
          b."BrmUserIds",
          COALESCE(mp.member_count, 0)::int AS "member_count"
        FROM public."BrmRenewalData" b
+       LEFT JOIN public."HealthInsuranceQuotationCase" lqc
+         ON lqc."ID" = b."LinkedQuotationCaseId"
+        AND COALESCE(lqc."IsDeleted", false) = false
        ${renewalMasterDataLateralJoin}
        ${where}
        ORDER BY b."EffectiveDate" DESC NULLS LAST
