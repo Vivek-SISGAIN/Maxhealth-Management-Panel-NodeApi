@@ -196,19 +196,20 @@ const query = async (sql, params = []) => {
   return serialize(rows);
 };
 
-/** Soft default = current calendar month (All Summary / dashboard parity) */
+/** Soft default From = current month start; To stays empty unless the client sent it. */
 const withDefaultDates = ({ dateFrom, dateTo } = {}) => {
   const now = new Date();
   const y = now.getFullYear();
   const m = now.getMonth();
   const monthStart = `${y}-${String(m + 1).padStart(2, "0")}-01`;
-  const lastDay = new Date(y, m + 1, 0).getDate();
-  const monthEnd = `${y}-${String(m + 1).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
   return {
     dateFrom: dateFrom && String(dateFrom).trim() ? String(dateFrom).trim() : monthStart,
-    dateTo: dateTo && String(dateTo).trim() ? String(dateTo).trim() : monthEnd,
+    dateTo: dateTo && String(dateTo).trim() ? String(dateTo).trim() : null,
   };
 };
+
+const sqlOpenEndedTo = (dateTo) =>
+  dateTo && String(dateTo).trim() ? String(dateTo).trim() : "9999-12-31";
 
 /** Parse one or many BRM display names from `brmName` / comma-separated list. */
 const parseBrmNames = (brmName) =>
@@ -273,14 +274,26 @@ const optionalDates = ({ dateFrom, dateTo } = {}) => ({
   dateTo: dateTo && String(dateTo).trim() ? String(dateTo).trim() : null,
 });
 
-/** If From→To spans more than maxDays, keep the last maxDays ending at dateTo (or today). */
+/** If From→To spans more than maxDays, keep the last maxDays ending at dateTo. Empty To stays open-ended. */
 const clampDateSpan = ({ dateFrom, dateTo } = {}, maxDays = 366) => {
-  const to = dateTo && String(dateTo).trim() ? new Date(String(dateTo).trim()) : new Date();
-  let from = dateFrom && String(dateFrom).trim() ? new Date(String(dateFrom).trim()) : null;
-  if (Number.isNaN(to.getTime())) {
-    return withDefaultDates({});
+  const iso = (d) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const toRaw = dateTo && String(dateTo).trim() ? new Date(String(dateTo).trim()) : null;
+  const fromRaw =
+    dateFrom && String(dateFrom).trim() ? new Date(String(dateFrom).trim()) : null;
+  const toOk = toRaw && !Number.isNaN(toRaw.getTime());
+  const fromOk = fromRaw && !Number.isNaN(fromRaw.getTime());
+
+  if (fromOk && !toOk) {
+    return { dateFrom: iso(fromRaw), dateTo: null };
   }
-  if (!from || Number.isNaN(from.getTime())) {
+  if (!fromOk && !toOk) {
+    return { dateFrom: null, dateTo: null };
+  }
+
+  let to = toRaw;
+  let from = fromRaw;
+  if (!fromOk) {
     from = new Date(to);
     from.setDate(from.getDate() - Math.min(maxDays, 31));
   }
@@ -289,8 +302,6 @@ const clampDateSpan = ({ dateFrom, dateTo } = {}, maxDays = 366) => {
   if (spanMs > maxMs) {
     from = new Date(to.getTime() - maxMs);
   }
-  const iso = (d) =>
-    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   return { dateFrom: iso(from), dateTo: iso(to) };
 };
 
@@ -704,11 +715,13 @@ async function getSummaryList({
   } else {
     conditions.push(`"PolicyExpiryDate" >= $${params.length}::date`);
   }
-  params.push(dates.dateTo);
-  if (type === "new" || type === "endorsement") {
-    conditions.push(`"PolicyEffectiveDate" <= $${params.length}::date`);
-  } else {
-    conditions.push(`"PolicyExpiryDate" <= $${params.length}::date`);
+  if (dates.dateTo) {
+    params.push(dates.dateTo);
+    if (type === "new" || type === "endorsement") {
+      conditions.push(`"PolicyEffectiveDate" <= $${params.length}::date`);
+    } else {
+      conditions.push(`"PolicyExpiryDate" <= $${params.length}::date`);
+    }
   }
 
   if (status && status !== "all") {
@@ -765,7 +778,7 @@ async function getSummaryList({
          TO_CHAR(MAX("PolicyExpiryDate"), 'DD-MM-YYYY') AS "PolicyExpiryDate",
          MAX("InsuranceCompany") AS "InsuranceCompany",
          MAX("BusinessRelationManager") AS "BusinessRelationManager",
-         COUNT(*)::int AS "memberCount",
+         COUNT(*) FILTER (WHERE "MemberDeletionDate" IS NULL)::int AS "memberCount",
          COALESCE(ROUND(SUM("GrossPremium")::numeric, 2), 0)::float AS "totalGrossPremium"
        FROM public."MasterDataLayer"
        ${whereClause}
@@ -1404,11 +1417,12 @@ async function getTrends({ period = "monthly", executiveId, dateFrom, dateTo } =
   const dates = withDefaultDates(clamped);
   const trunc = period === "yearly" ? "year" : "month";
   const fmt = period === "yearly" ? "'YYYY'" : "'YYYY-MM'";
+  const boundTo = sqlOpenEndedTo(dates.dateTo);
 
   const hasExec = executiveId && executiveId !== "all";
   const caseParams = hasExec
-    ? [executiveId, dates.dateFrom, dates.dateTo]
-    : [dates.dateFrom, dates.dateTo];
+    ? [executiveId, dates.dateFrom, boundTo]
+    : [dates.dateFrom, boundTo];
 
   const nbSql = hasExec
     ? `
@@ -1435,8 +1449,8 @@ async function getTrends({ period = "monthly", executiveId, dateFrom, dateTo } =
       GROUP BY 1 ORDER BY 1 ASC`;
 
   const renParams = hasExec
-    ? [executiveId, dates.dateFrom, dates.dateTo]
-    : [dates.dateFrom, dates.dateTo];
+    ? [executiveId, dates.dateFrom, boundTo]
+    : [dates.dateFrom, boundTo];
   // Fast renewal trends — PolicyExpiryDate via hash-join (not per-batch lateral)
   const renSql = hasExec
     ? `
@@ -1582,16 +1596,27 @@ async function getRenewals({
   const renewalMasterDataLateralJoin = `
     LEFT JOIN LATERAL (
       SELECT
-        COUNT(*)::int AS member_count,
-        COALESCE(SUM(m."GrossPremium"), 0)::float AS total_premium,
-        MAX(m."PolicyExpiryDate") FILTER (
-          WHERE m."PolicyExpiryDate" IS NOT NULL
-            AND m."PolicyExpiryDate" != 'infinity'::date
+        COUNT(*) FILTER (WHERE NOT x.deleted)::int AS member_count,
+        COALESCE(SUM(x.gross_premium) FILTER (WHERE NOT x.deleted), 0)::float AS total_premium,
+        MAX(x.expiry_date) FILTER (
+          WHERE x.expiry_date IS NOT NULL
+            AND x.expiry_date != 'infinity'::date
         ) AS expiry_date
-      FROM public."MasterDataLayer" m
-      WHERE (
-        (
-          m."EndorsementTypeCode" = '02'
+      FROM (
+        SELECT
+          COALESCE(
+            NULLIF(TRIM(m."CardNumber"::text), ''),
+            TRIM(COALESCE(m."MemberName", '')) || '|' || COALESCE(m."DOB"::text, '')
+          ) AS life_key,
+          BOOL_OR(
+            m."MemberDeletionDate" IS NOT NULL
+            AND m."MemberDeletionDate"::date <> DATE '1899-12-31'
+          ) AS deleted,
+          SUM(m."GrossPremium")::float AS gross_premium,
+          MAX(m."PolicyExpiryDate") AS expiry_date
+        FROM public."MasterDataLayer" m
+        WHERE NULLIF(TRIM(COALESCE(b."PolicyList", '')), '') IS NOT NULL
+          AND m."PolicyGroupCode"::text = TRIM(b."PolicyGroupCode"::text)
           AND m."TechnicalSheetNumber"::text = ANY(
             ARRAY(
               SELECT TRIM(val)
@@ -1599,12 +1624,8 @@ async function getRenewals({
               WHERE TRIM(val) <> ''
             )
           )
-        )
-        OR (
-          NULLIF(TRIM(COALESCE(b."PolicyGroupCode"::text, '')), '') IS NOT NULL
-          AND m."PolicyGroupCode"::text = TRIM(b."PolicyGroupCode"::text)
-        )
-      )
+        GROUP BY 1
+      ) x
     ) mp ON TRUE
   `;
 
@@ -2016,7 +2037,7 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
   }
 
   const bookedFrom = opt.dateFrom || trendDates.dateFrom;
-  const bookedTo = opt.dateTo || trendDates.dateTo;
+  const bookedTo = sqlOpenEndedTo(opt.dateTo || trendDates.dateTo);
   const bookedParams = [bookedFrom, bookedTo];
 
   // Renewals: PolicyExpiryDate via one hash-join (not per-row lateral — was causing 60s+ timeouts)
@@ -2314,7 +2335,7 @@ async function getOverviewSnapshot({ dateFrom, dateTo, executiveId, dealStatus, 
  */
 async function getLostReasonMix({ dateFrom, dateTo, brmName } = {}) {
   const dates = withDefaultDates({ dateFrom, dateTo });
-  const params = [dates.dateFrom, dates.dateTo];
+  const params = [dates.dateFrom, sqlOpenEndedTo(dates.dateTo)];
   const brmNames = parseBrmNames(brmName);
   const brmIds = brmNames.length ? await resolveAspNetIdsByNames(brmNames) : [];
 
