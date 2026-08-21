@@ -431,7 +431,7 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
   const cacheKey =
-    `mgmt:brm:summaryCards:v2-status3-cps:${brmNames.length ? brmNames.join("|").toLowerCase() : "all"}:` +
+    `mgmt:brm:summaryCards:v3-rn-linked-cps:${brmNames.length ? brmNames.join("|").toLowerCase() : "all"}:` +
     `${dates.dateFrom || ""}:${dates.dateTo || ""}`;
   if (redis) {
     try {
@@ -579,63 +579,28 @@ async function getSummaryCards({ dateFrom, dateTo, brmName } = {}) {
         (
           SELECT COUNT(*)::int
           FROM public."BrmRenewalData" brd
-          LEFT JOIN public."HealthInsuranceQuotationCase" lqc
+          INNER JOIN public."HealthInsuranceQuotationCase" lqc
             ON lqc."ID" = brd."LinkedQuotationCaseId"
            AND COALESCE(lqc."IsDeleted", false) = false
           WHERE brd."BatchStatus" = 'Distributed'
-            AND (
-              (
-                brd."LinkedQuotationCaseId" IS NOT NULL
-                AND lqc."Status" = 3
-                AND COALESCE(lqc."BookingStatus", false) = false
-              )
-              OR (
-                brd."LinkedQuotationCaseId" IS NULL
-                AND brd."BrmActionStatus" = 2
-              )
-            )
+            AND brd."LinkedQuotationCaseId" IS NOT NULL
+            AND lqc."Status" = 3
+            AND COALESCE(lqc."BookingStatus", false) = false
             ${rnDateSql}
             ${rnAssignFilter}
         ) AS "confirmedRenewalCount",
         (
-          SELECT COALESCE(SUM(
-            COALESCE(
-              NULLIF(cps."NetPremium"::float, 0),
-              NULLIF(brd."ExpiringPremium"::float, 0),
-              mp.total_premium,
-              0
-            )
-          ), 0)::float
+          SELECT COALESCE(SUM(COALESCE(cps."NetPremium", 0)::float), 0)::float
           FROM public."BrmRenewalData" brd
-          LEFT JOIN public."HealthInsuranceQuotationCase" lqc
+          INNER JOIN public."HealthInsuranceQuotationCase" lqc
             ON lqc."ID" = brd."LinkedQuotationCaseId"
            AND COALESCE(lqc."IsDeleted", false) = false
           LEFT JOIN public."CasePremiumSummary" cps
             ON cps."CaseID" = lqc."ID"
-          LEFT JOIN LATERAL (
-            SELECT COALESCE(SUM(m."GrossPremium"), 0)::float AS total_premium
-            FROM public."MasterDataLayer" m
-            WHERE m."EndorsementTypeCode" = '02'
-              AND m."TechnicalSheetNumber"::text = ANY(
-                ARRAY(
-                  SELECT TRIM(val)
-                  FROM unnest(string_to_array(REPLACE(COALESCE(brd."PolicyList", ''), ' ', ''), ',')) AS val
-                  WHERE TRIM(val) <> ''
-                )
-              )
-          ) mp ON TRUE
           WHERE brd."BatchStatus" = 'Distributed'
-            AND (
-              (
-                brd."LinkedQuotationCaseId" IS NOT NULL
-                AND lqc."Status" = 3
-                AND COALESCE(lqc."BookingStatus", false) = false
-              )
-              OR (
-                brd."LinkedQuotationCaseId" IS NULL
-                AND brd."BrmActionStatus" = 2
-              )
-            )
+            AND brd."LinkedQuotationCaseId" IS NOT NULL
+            AND lqc."Status" = 3
+            AND COALESCE(lqc."BookingStatus", false) = false
             ${rnDateSql}
             ${rnAssignFilter}
         ) AS "confirmedRenewalPremium"
