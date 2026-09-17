@@ -413,35 +413,50 @@ router.patch("/approvals/:id/approve", async (req, res) => {
       return res.status(404).json({ success: false, message: "Member workbench record not found" });
     }
 
-    const stage = MEDICAL_STAGES.APPROVED;
     const decidedBy = req.body.decidedBy || "management";
-    const at = new Date().toISOString();
-    const nextMember = {
-      ...member,
-      stage,
-      stageUpdatedAt: at,
-      stageHistory: [...(member.stageHistory || []), { stage, at, by: decidedBy, notes: req.body.notes || null }],
-      messages: [
-        ...(member.messages || []),
-        { direction: "MANAGEMENT_TO_MEDICAL_UW", at, by: decidedBy, notes: req.body.notes || null, decision: "APPROVED" },
-      ],
-      managementDecision: { decision: "APPROVED", notes: req.body.notes || null, at, by: decidedBy },
-    };
+    const caseInternalId = task.CaseId;
+    const medicalBase = process.env.MEDICAL_API_BASE_URL || "http://localhost:2808";
+    const serviceSecret = process.env.MUW_SERVICE_SECRET || "";
 
-    const updated = await prisma.medicalTask.update({
-      where: { Id: taskId },
-      data: {
-        Metadata: {
-          ...(task.Metadata || {}),
-          doctorWorkbench: {
-            ...((task.Metadata || {}).doctorWorkbench || {}),
-            members: { ...members, [memberId]: nextMember },
-          },
+    const upstream = await fetch(
+      `${medicalBase}/medical/underwriting/workbench/management-decision`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(serviceSecret ? { "x-muw-service-secret": serviceSecret } : {}),
+          ...(req.headers.authorization
+            ? { Authorization: req.headers.authorization }
+            : {}),
         },
+        body: JSON.stringify({
+          caseId: caseInternalId,
+          memberId,
+          decision: "APPROVED",
+          notes: req.body.notes || null,
+          decidedBy,
+        }),
       },
-    });
+    );
+    const upstreamJson = await upstream.json().catch(() => ({}));
+    if (!upstream.ok) {
+      return res.status(upstream.status || 502).json({
+        success: false,
+        message:
+          upstreamJson?.message ||
+          "Failed to apply management decision via Medical service",
+      });
+    }
 
-    await syncMemberDecision(memberId, "APPROVED", decidedBy, req.body.notes || null);
+    const nextMember = upstreamJson?.data || {
+      ...member,
+      stage: MEDICAL_STAGES.APPROVED,
+      managementDecision: {
+        decision: "APPROVED",
+        notes: req.body.notes || null,
+        by: decidedBy,
+      },
+    };
 
     await writeManagementAudit({
       eventType: "APPROVAL_APPROVE",
@@ -451,6 +466,7 @@ router.patch("/approvals/:id/approve", async (req, res) => {
       module: "approvals",
     });
 
+    const refreshed = await prisma.medicalTask.findUnique({ where: { Id: taskId } });
     const uwCase = task.CaseId
       ? await prisma.underwritingCase.findFirst({
           where: { OR: [{ Id: task.CaseId }, { CaseId: task.CaseId }] },
@@ -464,7 +480,7 @@ router.patch("/approvals/:id/approve", async (req, res) => {
       success: true,
       data: {
         ...transformMedicalApproval({
-          task: updated,
+          task: refreshed || task,
           memberId,
           underwritingCase: uwCase,
           underwritingMember: uwMember,
@@ -498,35 +514,50 @@ router.patch("/approvals/:id/reject", async (req, res) => {
       return res.status(404).json({ success: false, message: "Member workbench record not found" });
     }
 
-    const stage = MEDICAL_STAGES.REJECTED;
     const decidedBy = req.body.decidedBy || "management";
-    const at = new Date().toISOString();
-    const nextMember = {
-      ...member,
-      stage,
-      stageUpdatedAt: at,
-      stageHistory: [...(member.stageHistory || []), { stage, at, by: decidedBy, notes: req.body.notes || null }],
-      messages: [
-        ...(member.messages || []),
-        { direction: "MANAGEMENT_TO_MEDICAL_UW", at, by: decidedBy, notes: req.body.notes || null, decision: "REJECTED" },
-      ],
-      managementDecision: { decision: "REJECTED", notes: req.body.notes || null, at, by: decidedBy },
-    };
+    const caseInternalId = task.CaseId;
+    const medicalBase = process.env.MEDICAL_API_BASE_URL || "http://localhost:2808";
+    const serviceSecret = process.env.MUW_SERVICE_SECRET || "";
 
-    const updated = await prisma.medicalTask.update({
-      where: { Id: taskId },
-      data: {
-        Metadata: {
-          ...(task.Metadata || {}),
-          doctorWorkbench: {
-            ...((task.Metadata || {}).doctorWorkbench || {}),
-            members: { ...members, [memberId]: nextMember },
-          },
+    const upstream = await fetch(
+      `${medicalBase}/medical/underwriting/workbench/management-decision`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(serviceSecret ? { "x-muw-service-secret": serviceSecret } : {}),
+          ...(req.headers.authorization
+            ? { Authorization: req.headers.authorization }
+            : {}),
         },
+        body: JSON.stringify({
+          caseId: caseInternalId,
+          memberId,
+          decision: "REJECTED",
+          notes: req.body.notes || null,
+          decidedBy,
+        }),
       },
-    });
+    );
+    const upstreamJson = await upstream.json().catch(() => ({}));
+    if (!upstream.ok) {
+      return res.status(upstream.status || 502).json({
+        success: false,
+        message:
+          upstreamJson?.message ||
+          "Failed to apply management decision via Medical service",
+      });
+    }
 
-    await syncMemberDecision(memberId, "REJECTED", decidedBy, req.body.notes || null);
+    const nextMember = upstreamJson?.data || {
+      ...member,
+      stage: MEDICAL_STAGES.REJECTED,
+      managementDecision: {
+        decision: "REJECTED",
+        notes: req.body.notes || null,
+        by: decidedBy,
+      },
+    };
 
     await writeManagementAudit({
       eventType: "APPROVAL_REJECT",
@@ -536,6 +567,7 @@ router.patch("/approvals/:id/reject", async (req, res) => {
       module: "approvals",
     });
 
+    const refreshed = await prisma.medicalTask.findUnique({ where: { Id: taskId } });
     const uwCase = task.CaseId
       ? await prisma.underwritingCase.findFirst({
           where: { OR: [{ Id: task.CaseId }, { CaseId: task.CaseId }] },
@@ -549,7 +581,7 @@ router.patch("/approvals/:id/reject", async (req, res) => {
       success: true,
       data: {
         ...transformMedicalApproval({
-          task: updated,
+          task: refreshed || task,
           memberId,
           underwritingCase: uwCase,
           underwritingMember: uwMember,
