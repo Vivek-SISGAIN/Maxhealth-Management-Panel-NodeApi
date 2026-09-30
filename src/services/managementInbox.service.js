@@ -32,13 +32,22 @@ async function ensureTable() {
   tableReady = true;
 }
 
-async function upsertNotification({ type, title, message, sourceKey, module, linkModule }) {
+async function upsertNotification({ type, title, message, sourceKey, module, linkModule, legacyKey, legacyNotBefore }) {
   await ensureTable();
   const existing = await prisma.$queryRawUnsafe(
     `SELECT "Id" FROM "ManagementInboxNotification" WHERE "SourceKey" = $1 LIMIT 1`,
     sourceKey,
   );
   if (existing?.length) return existing[0];
+  // Old-format key already notified for this same submission → don't duplicate
+  if (legacyKey && legacyNotBefore) {
+    const legacy = await prisma.$queryRawUnsafe(
+      `SELECT "Id" FROM "ManagementInboxNotification" WHERE "SourceKey" = $1 AND "CreatedAt" >= $2::timestamptz LIMIT 1`,
+      legacyKey,
+      new Date(legacyNotBefore).toISOString(),
+    );
+    if (legacy?.length) return legacy[0];
+  }
   const id = randomUUID();
   await prisma.$executeRawUnsafe(
     `INSERT INTO "ManagementInboxNotification"
@@ -73,25 +82,61 @@ async function syncFromLiveEvents() {
     take: 120,
   });
 
+  // Collect pending members first so names / case numbers can be looked up in bulk
+  const pending = [];
   for (const task of tasks) {
     const members = task.Metadata?.doctorWorkbench?.members || {};
     for (const [memberId, wb] of Object.entries(members)) {
       if (!wb || typeof wb !== "object") continue;
       const stage = String(wb.stage || "");
       if (stage !== "SENT_FOR_MANAGEMENT_APPROVAL" && stage !== "RESUBMITTED") continue;
-      const name =
-        wb.formSnapshot?.memberName ||
-        wb.formSnapshot?.name ||
-        memberId;
-      await upsertNotification({
-        type: "approval_required",
-        title: "Medical UW approval required",
-        message: `${name} · case ${task.CaseId || "—"} sent for management decision`,
-        sourceKey: `approval:${task.Id}:${memberId}`,
-        module: "medical",
-        linkModule: "medical-approvals",
-      });
+      pending.push({ task, memberId, wb });
     }
+  }
+
+  const memberRows = pending.length
+    ? await prisma.underwritingMember
+        .findMany({
+          where: { Id: { in: pending.map((p) => p.memberId) } },
+          select: { Id: true, Name: true },
+        })
+        .catch(() => [])
+    : [];
+  const caseRows = pending.length
+    ? await prisma.underwritingCase
+        .findMany({
+          where: { Id: { in: [...new Set(pending.map((p) => p.task.CaseId).filter(Boolean))] } },
+          select: { Id: true, CaseId: true, Client: true },
+        })
+        .catch(() => [])
+    : [];
+  const nameById = new Map(memberRows.map((m) => [m.Id, m.Name]));
+  const caseById = new Map(caseRows.map((c) => [c.Id, c]));
+
+  for (const { task, memberId, wb } of pending) {
+    const name =
+      nameById.get(memberId) ||
+      wb.formSnapshot?.memberName ||
+      wb.formSnapshot?.name ||
+      "Member";
+    const c = caseById.get(task.CaseId);
+    const caseLabel = c?.CaseId || task.CaseId || "—";
+    const client = c?.Client ? ` · ${c.Client}` : "";
+    const resubmitted = (wb.stageHistory || []).filter(
+      (h) => h?.stage === "SENT_FOR_MANAGEMENT_APPROVAL",
+    ).length > 1;
+    // Key includes the submission time → every (re)submission notifies again
+    const sentAt = wb.stageUpdatedAt ? new Date(wb.stageUpdatedAt).getTime() : 0;
+    await upsertNotification({
+      type: "approval_required",
+      title: resubmitted ? "Medical UW resubmitted for approval" : "Medical UW approval required",
+      message: `${name} · case ${caseLabel}${client} — sent by Medical team for management decision`,
+      sourceKey: `approval:${task.Id}:${memberId}:${sentAt}`,
+      legacyKey: `approval:${task.Id}:${memberId}`,
+      legacyNotBefore: wb.stageUpdatedAt || null,
+      module: "medical",
+      linkModule: "medical-approvals",
+    });
   }
 
   // 2) Active alerts
